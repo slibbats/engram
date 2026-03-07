@@ -160,6 +160,11 @@ func New(cfg cloud.Config) (*CloudStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("cloudstore: schema init: %w", err)
 	}
+	if _, err := tx.Exec(`ALTER TABLE cloud_project_controls ADD COLUMN IF NOT EXISTS paused_reason TEXT`); err != nil {
+		tx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("cloudstore: project controls migration: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("cloudstore: commit schema tx: %w", err)
@@ -247,6 +252,20 @@ func (cs *CloudStore) GetUserByAPIKeyHash(hash string) (*CloudUser, error) {
 	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: get user by api key hash: %w", err)
+	}
+	return &u, nil
+}
+
+// GetUserByID retrieves a user by id.
+func (cs *CloudStore) GetUserByID(userID string) (*CloudUser, error) {
+	var u CloudUser
+	err := cs.db.QueryRow(
+		`SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
+		 FROM cloud_users WHERE id = $1`,
+		userID,
+	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: get user by id: %w", err)
 	}
 	return &u, nil
 }
@@ -342,6 +361,88 @@ func (cs *CloudStore) RecentSessions(userID, project string, limit int) ([]Cloud
 	return results, rows.Err()
 }
 
+// GetSession retrieves a single session by ID, scoped to user_id.
+func (cs *CloudStore) GetSession(userID, sessionID string) (*CloudSession, error) {
+	var s CloudSession
+	err := cs.db.QueryRow(
+		`SELECT id, user_id, project, directory, started_at, ended_at, summary
+		 FROM cloud_sessions
+		 WHERE id = $1 AND user_id = $2`,
+		sessionID, userID,
+	).Scan(&s.ID, &s.UserID, &s.Project, &s.Directory, &s.StartedAt, &s.EndedAt, &s.Summary)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: get session: %w", err)
+	}
+	return &s, nil
+}
+
+// SessionObservations returns all live observations for a single session.
+func (cs *CloudStore) SessionObservations(userID, sessionID string, limit int) ([]CloudObservation, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+
+	rows, err := cs.db.Query(
+		`SELECT id, user_id, session_id, type, title, content, tool_name, project,
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at,
+		        created_at, updated_at, deleted_at
+		 FROM cloud_observations
+		 WHERE user_id = $1 AND session_id = $2 AND deleted_at IS NULL
+		 ORDER BY created_at ASC
+		 LIMIT $3`,
+		userID, sessionID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: session observations: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CloudObservation
+	for rows.Next() {
+		var o CloudObservation
+		if err := rows.Scan(
+			&o.ID, &o.UserID, &o.SessionID, &o.Type, &o.Title, &o.Content,
+			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey,
+			&o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan session observation: %w", err)
+		}
+		results = append(results, o)
+	}
+	return results, rows.Err()
+}
+
+// SessionPrompts returns prompts captured during a single session.
+func (cs *CloudStore) SessionPrompts(userID, sessionID string, limit int) ([]CloudPrompt, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+
+	rows, err := cs.db.Query(
+		`SELECT id, user_id, session_id, content, COALESCE(project, '') AS project, created_at
+		 FROM cloud_prompts
+		 WHERE user_id = $1 AND session_id = $2
+		 ORDER BY created_at ASC
+		 LIMIT $3`,
+		userID, sessionID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: session prompts: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CloudPrompt
+	for rows.Next() {
+		var p CloudPrompt
+		if err := rows.Scan(&p.ID, &p.UserID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan session prompt: %w", err)
+		}
+		results = append(results, p)
+	}
+	return results, rows.Err()
+}
+
 // ─── Observations ───────────────────────────────────────────────────────────
 
 // AddObservation creates a new observation for the given user.
@@ -391,6 +492,11 @@ func (cs *CloudStore) GetObservation(userID string, id int64) (*CloudObservation
 // RecentObservations returns recent observations for a user, optionally filtered
 // by project and scope.
 func (cs *CloudStore) RecentObservations(userID, project, scope string, limit int) ([]CloudObservation, error) {
+	return cs.FilterObservations(userID, project, scope, "", limit)
+}
+
+// FilterObservations returns recent observations filtered by project, scope, and type.
+func (cs *CloudStore) FilterObservations(userID, project, scope, obsType string, limit int) ([]CloudObservation, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -413,6 +519,11 @@ func (cs *CloudStore) RecentObservations(userID, project, scope string, limit in
 	if scope != "" {
 		query += fmt.Sprintf(" AND scope = $%d", argN)
 		args = append(args, normalizeScope(scope))
+		argN++
+	}
+	if obsType != "" {
+		query += fmt.Sprintf(" AND type = $%d", argN)
+		args = append(args, obsType)
 		argN++
 	}
 
@@ -511,6 +622,21 @@ func (cs *CloudStore) RecentPrompts(userID, project string, limit int) ([]CloudP
 		results = append(results, p)
 	}
 	return results, rows.Err()
+}
+
+// GetPrompt retrieves a single prompt by id, scoped to user_id.
+func (cs *CloudStore) GetPrompt(userID string, id int64) (*CloudPrompt, error) {
+	var p CloudPrompt
+	err := cs.db.QueryRow(
+		`SELECT id, user_id, session_id, content, COALESCE(project, '') AS project, created_at
+		 FROM cloud_prompts
+		 WHERE id = $1 AND user_id = $2`,
+		id, userID,
+	).Scan(&p.ID, &p.UserID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: get prompt: %w", err)
+	}
+	return &p, nil
 }
 
 // ─── Chunks ─────────────────────────────────────────────────────────────────
@@ -902,13 +1028,13 @@ func (cs *CloudStore) UserProjects(userID string) ([]string, error) {
 
 // CloudMutation represents a single append-only mutation in the cloud ledger.
 type CloudMutation struct {
-	Seq        int64  `json:"seq"`
-	UserID     string `json:"user_id"`
-	Entity     string `json:"entity"`
-	EntityKey  string `json:"entity_key"`
-	Op         string `json:"op"`
-	Payload    string `json:"payload"`
-	OccurredAt string `json:"occurred_at"`
+	Seq        int64           `json:"seq"`
+	UserID     string          `json:"user_id"`
+	Entity     string          `json:"entity"`
+	EntityKey  string          `json:"entity_key"`
+	Op         string          `json:"op"`
+	Payload    json.RawMessage `json:"payload"`
+	OccurredAt string          `json:"occurred_at"`
 }
 
 // PushMutationsRequest holds the JSON body for POST /sync/mutations/push.
@@ -959,6 +1085,11 @@ func (cs *CloudStore) AppendMutationBatch(userID string, entries []PushMutationE
 	if len(entries) == 0 {
 		return &PushMutationsResult{}, nil
 	}
+	for _, e := range entries {
+		if err := cs.ensureProjectSyncEnabled(e.Entity, e.Payload); err != nil {
+			return nil, err
+		}
+	}
 	tx, err := cs.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: begin mutation batch: %w", err)
@@ -991,34 +1122,61 @@ func (cs *CloudStore) PullMutations(userID string, sinceSeq int64, limit int) (*
 	if limit <= 0 {
 		limit = 100
 	}
-	// Fetch limit+1 to detect whether there are more rows.
-	rows, err := cs.db.Query(
-		`SELECT seq, user_id, entity, entity_key, op, payload, occurred_at
-		 FROM cloud_mutations
-		 WHERE user_id = $1 AND seq > $2
-		 ORDER BY seq ASC
-		 LIMIT $3`,
-		userID, sinceSeq, limit+1,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: pull mutations: %w", err)
-	}
-	defer rows.Close()
-
 	var mutations []CloudMutation
-	for rows.Next() {
-		var m CloudMutation
-		if err := rows.Scan(&m.Seq, &m.UserID, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.OccurredAt); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan mutation: %w", err)
+	lastSeq := sinceSeq
+	hasMore := false
+	for len(mutations) < limit+1 {
+		rows, err := cs.db.Query(
+			`SELECT seq, user_id, entity, entity_key, op, payload, occurred_at
+			 FROM cloud_mutations
+			 WHERE user_id = $1 AND seq > $2
+			 ORDER BY seq ASC
+			 LIMIT $3`,
+			userID, lastSeq, limit+1,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("cloudstore: pull mutations: %w", err)
 		}
-		mutations = append(mutations, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("cloudstore: pull mutations rows: %w", err)
+
+		fetched := 0
+		for rows.Next() {
+			fetched++
+			var m CloudMutation
+			if err := rows.Scan(&m.Seq, &m.UserID, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.OccurredAt); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("cloudstore: scan mutation: %w", err)
+			}
+			lastSeq = m.Seq
+			project, err := projectFromMutation(m.Entity, m.Payload)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("cloudstore: pull project from mutation: %w", err)
+			}
+			enabled, err := cs.IsProjectSyncEnabled(project)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !enabled {
+				continue
+			}
+			mutations = append(mutations, m)
+			if len(mutations) > limit {
+				hasMore = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("cloudstore: pull mutations rows: %w", err)
+		}
+		rows.Close()
+		if hasMore || fetched < limit+1 {
+			break
+		}
 	}
 
-	hasMore := len(mutations) > limit
-	if hasMore {
+	if len(mutations) > limit {
 		mutations = mutations[:limit]
 	}
 	if mutations == nil {
@@ -1036,7 +1194,7 @@ func (cs *CloudStore) UpsertSessionByPayload(userID string, payload json.RawMess
 		EndedAt   *string `json:"ended_at,omitempty"`
 		Summary   *string `json:"summary,omitempty"`
 	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := decodeMutationPayload(payload, &p); err != nil {
 		return fmt.Errorf("cloudstore: unmarshal session payload: %w", err)
 	}
 	_, err := cs.db.Exec(
@@ -1066,7 +1224,7 @@ func (cs *CloudStore) UpsertObservationByPayload(userID string, payload json.Raw
 		Scope     string  `json:"scope"`
 		TopicKey  *string `json:"topic_key,omitempty"`
 	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := decodeMutationPayload(payload, &p); err != nil {
 		return fmt.Errorf("cloudstore: unmarshal observation payload: %w", err)
 	}
 	scope := normalizeScope(p.Scope)
@@ -1117,7 +1275,7 @@ func (cs *CloudStore) DeleteObservationByPayload(userID string, payload json.Raw
 		DeletedAt  *string `json:"deleted_at,omitempty"`
 		HardDelete bool    `json:"hard_delete"`
 	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := decodeMutationPayload(payload, &p); err != nil {
 		return fmt.Errorf("cloudstore: unmarshal delete payload: %w", err)
 	}
 	// For the cloud side, we can't match by sync_id since the cloud schema
@@ -1135,7 +1293,7 @@ func (cs *CloudStore) UpsertPromptByPayload(userID string, payload json.RawMessa
 		Content   string  `json:"content"`
 		Project   *string `json:"project,omitempty"`
 	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := decodeMutationPayload(payload, &p); err != nil {
 		return fmt.Errorf("cloudstore: unmarshal prompt payload: %w", err)
 	}
 	// Insert new prompt (prompts are append-only in the cloud schema).
@@ -1173,6 +1331,21 @@ func nullableString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+func decodeMutationPayload(payload json.RawMessage, dest any) error {
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" {
+		return fmt.Errorf("empty payload")
+	}
+	if trimmed[0] != '"' {
+		return json.Unmarshal([]byte(trimmed), dest)
+	}
+	var encoded string
+	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(encoded), dest)
 }
 
 // normalizeScope normalizes scope values, matching the local store pattern.

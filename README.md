@@ -662,6 +662,8 @@ Sync memories across machines via a Postgres-backed cloud server. **Auto-sync is
 - Manual one-off sync: `engram cloud sync` (push + pull, then exit)
 - Check sync health: `engram cloud sync-status` (pending mutations, degraded state)
 - Project-scoped sync: `engram cloud enroll <project>` to choose which projects sync to the cloud
+- Cloud-managed org policy: admins can pause/resume sync per project from the dashboard, with reason + audit trail
+- Autosync batches pushes by project, so one paused project does not block unrelated project mutations
 - **Web Dashboard**: Browse knowledge, projects, and contributor stats in the browser at `/dashboard/`
 - Legacy chunk-based sync: `engram cloud sync --legacy` (deprecated, preserved for backward compatibility)
 - Client contract stays simple: one reachable base URL + one token
@@ -672,11 +674,11 @@ See `DOCS.md` for the full cloud workflow, dashboard setup, security notes, and 
 
 A server-rendered web UI embedded in `engram cloud serve`. Navigate to `http://<server>/dashboard/` and log in with your cloud credentials.
 
-- **Dashboard** — Project enrollment overview with stats
-- **Browser** — Search and browse observations, sessions, prompts
-- **Projects** — Per-project detail views with session timelines
-- **Contributors** — Per-developer stats and sync activity
-- **Admin** — System health, user management (requires `ENGRAM_CLOUD_ADMIN` env var)
+- **Dashboard** — Shared-memory overview with synced project stats
+- **Browser** — Search and browse observations, sessions, and prompts with linked detail pages
+- **Projects** — Per-project detail views, pause status, and recent activity
+- **Contributors** — Per-developer stats plus drill-down into sessions, observations, and prompts
+- **Admin** — System health, user management, and project sync controls (requires `ENGRAM_CLOUD_ADMIN` env var)
 
 Built with templ + htmx — zero JS build step, ships inside the single binary.
 
@@ -840,7 +842,7 @@ engram/
 │   ├── sync/sync.go                # Git sync: manifest + compressed chunks
 │   ├── cloud/
 │   │   ├── autosync/manager.go     # Background auto-sync manager (lease + backoff)
-│   │   ├── cloudstore/             # Postgres storage (schema, CRUD, mutations)
+│   │   ├── cloudstore/             # Postgres storage (schema, CRUD, search, project controls)
 │   │   ├── cloudserver/            # Cloud HTTP API (auth, push/pull, mutations)
 │   │   ├── dashboard/              # Embedded web dashboard (templ + htmx)
 │   │   └── remote/transport.go     # HTTP client for cloud sync
@@ -857,7 +859,7 @@ engram/
 │       ├── hooks/hooks.json
 │       ├── scripts/                # session-start, post-compaction, subagent-stop, session-stop
 │       └── skills/memory/SKILL.md
-├── skills/                         # Contributor AI skills (repo-wide standards)
+├── skills/                         # Contributor AI skills (repo-wide standards + Engram-specific guardrails)
 ├── setup.sh                        # Links repo skills into .claude/.codex/.gemini (project-local)
 ├── assets/                         # Screenshots and media
 ├── DOCS.md                         # Full technical documentation

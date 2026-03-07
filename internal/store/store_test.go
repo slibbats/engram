@@ -442,6 +442,95 @@ func TestNewMigratesLegacyObservationIDSchema(t *testing.T) {
 	}
 }
 
+func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "engram.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			project TEXT NOT NULL,
+			directory TEXT NOT NULL,
+			started_at TEXT NOT NULL DEFAULT (datetime('now')),
+			ended_at TEXT,
+			summary TEXT
+		);
+		CREATE TABLE user_prompts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			content TEXT NOT NULL,
+			project TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (session_id) REFERENCES sessions(id)
+		);
+		INSERT INTO sessions (id, project, directory) VALUES ('s1', 'engram', '/tmp/engram');
+		INSERT INTO user_prompts (session_id, content, project) VALUES ('s1', 'legacy prompt', 'engram');
+	`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("seed legacy db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = dataDir
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store after legacy prompt schema: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var syncID string
+	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "legacy prompt").Scan(&syncID); err != nil {
+		t.Fatalf("query migrated prompt sync_id: %v", err)
+	}
+	if syncID == "" {
+		t.Fatalf("expected migrated prompt sync_id to be backfilled")
+	}
+
+	var hasSyncIDColumn bool
+	rows, err := s.db.Query("PRAGMA table_info(user_prompts)")
+	if err != nil {
+		t.Fatalf("query prompt columns: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan prompt column: %v", err)
+		}
+		if name == "sync_id" {
+			hasSyncIDColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate prompt columns: %v", err)
+	}
+	if !hasSyncIDColumn {
+		t.Fatalf("expected user_prompts.sync_id column after migration")
+	}
+
+	var indexName string
+	if err := s.db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_prompts_sync_id'").Scan(&indexName); err != nil {
+		t.Fatalf("query prompt sync index: %v", err)
+	}
+	if indexName != "idx_prompts_sync_id" {
+		t.Fatalf("expected idx_prompts_sync_id to exist, got %q", indexName)
+	}
+}
+
 func TestSuggestTopicKeyNormalizesDeterministically(t *testing.T) {
 	got := SuggestTopicKey("Architecture", "  Auth Model  ", "ignored")
 	if got != "architecture/auth-model" {
@@ -1261,6 +1350,30 @@ func TestApplyRemoteMutationIdempotent(t *testing.T) {
 	}
 	if state.LastPulledSeq != 43 {
 		t.Fatalf("expected last pulled seq 43, got %d", state.LastPulledSeq)
+	}
+}
+
+func TestApplyPulledMutationAcceptsStringifiedSessionPayload(t *testing.T) {
+	s := newTestStore(t)
+
+	mutation := SyncMutation{
+		Seq:       1,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntitySession,
+		EntityKey: "remote-session",
+		Op:        SyncOpUpsert,
+		Payload:   `"{\"id\":\"remote-session\",\"project\":\"engram\",\"directory\":\"/remote\"}"`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+		t.Fatalf("apply stringified session mutation: %v", err)
+	}
+
+	session, err := s.GetSession("remote-session")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if session.Project != "engram" || session.Directory != "/remote" {
+		t.Fatalf("unexpected session after pulled apply: %+v", session)
 	}
 }
 
@@ -2920,6 +3033,283 @@ func TestEnrollProjectIdempotent(t *testing.T) {
 	}
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 enrolled project after double-enroll, got %d", len(projects))
+	}
+}
+
+func TestEnrollProjectBackfillsHistoricalMutations(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory, ended_at, summary) VALUES (?, ?, ?, datetime('now'), ?)`,
+		"legacy-session", "legacy-proj", "/tmp/legacy", "done",
+	); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
+		"obs-legacy", "legacy-session", "decision", "Legacy obs", "Historical content", "legacy-proj", "project", hashNormalized("Historical content"),
+	); err != nil {
+		t.Fatalf("insert observation: %v", err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
+		"prompt-legacy", "legacy-session", "What happened before enterprise?", "legacy-proj",
+	); err != nil {
+		t.Fatalf("insert prompt: %v", err)
+	}
+
+	var before int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatalf("count mutations before enroll: %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("expected 0 sync mutations before enroll, got %d", before)
+	}
+
+	if err := s.EnrollProject("legacy-proj"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	if len(mutations) != 3 {
+		t.Fatalf("expected 3 backfilled mutations, got %d", len(mutations))
+	}
+
+	expected := map[string]string{
+		SyncEntitySession:     "legacy-session",
+		SyncEntityObservation: "obs-legacy",
+		SyncEntityPrompt:      "prompt-legacy",
+	}
+	for _, mutation := range mutations {
+		entityKey, ok := expected[mutation.Entity]
+		if !ok {
+			t.Fatalf("unexpected mutation entity %q", mutation.Entity)
+		}
+		if mutation.EntityKey != entityKey {
+			t.Fatalf("expected entity_key %q for %s, got %q", entityKey, mutation.Entity, mutation.EntityKey)
+		}
+		if mutation.Project != "legacy-proj" {
+			t.Fatalf("expected project legacy-proj, got %q", mutation.Project)
+		}
+	}
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatalf("get sync state: %v", err)
+	}
+	if state.LastEnqueuedSeq != 3 {
+		t.Fatalf("expected last_enqueued_seq 3 after backfill, got %d", state.LastEnqueuedSeq)
+	}
+}
+
+func TestEnrollProjectBackfillIsIdempotentAndSkipsExistingMutations(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`,
+		"legacy-session", "legacy-proj", "/tmp/legacy",
+	); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
+		"obs-legacy", "legacy-session", "decision", "Legacy obs", "Historical content", "legacy-proj", "project", hashNormalized("Historical content"),
+	); err != nil {
+		t.Fatalf("insert observation: %v", err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
+		"prompt-legacy", "legacy-session", "Historical prompt", "legacy-proj",
+	); err != nil {
+		t.Fatalf("insert prompt: %v", err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		DefaultSyncTargetKey, SyncEntityObservation, "obs-legacy", SyncOpUpsert, `{"sync_id":"obs-legacy","session_id":"legacy-session","project":"legacy-proj"}`, SyncSourceLocal, "legacy-proj",
+	); err != nil {
+		t.Fatalf("insert existing mutation: %v", err)
+	}
+
+	if err := s.EnrollProject("legacy-proj"); err != nil {
+		t.Fatalf("first enroll: %v", err)
+	}
+
+	var afterFirst int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&afterFirst); err != nil {
+		t.Fatalf("count after first enroll: %v", err)
+	}
+	if afterFirst != 3 {
+		t.Fatalf("expected 3 total mutations after first enroll, got %d", afterFirst)
+	}
+
+	var observationMutations int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, "obs-legacy").Scan(&observationMutations); err != nil {
+		t.Fatalf("count observation mutations: %v", err)
+	}
+	if observationMutations != 1 {
+		t.Fatalf("expected existing observation mutation to remain single, got %d rows", observationMutations)
+	}
+
+	if err := s.EnrollProject("legacy-proj"); err != nil {
+		t.Fatalf("second enroll: %v", err)
+	}
+
+	var afterSecond int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&afterSecond); err != nil {
+		t.Fatalf("count after second enroll: %v", err)
+	}
+	if afterSecond != afterFirst {
+		t.Fatalf("expected no duplicate backfill on re-enroll, got %d mutations after second enroll vs %d after first", afterSecond, afterFirst)
+	}
+}
+
+func TestNewRepairsAlreadyEnrolledProjectsMissingHistoricalSyncMutations(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "engram.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+
+	obsHash := hashNormalized("Historical content")
+	_, err = db.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			project TEXT NOT NULL,
+			directory TEXT NOT NULL,
+			started_at TEXT NOT NULL DEFAULT (datetime('now')),
+			ended_at TEXT,
+			summary TEXT
+		);
+		CREATE TABLE observations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id TEXT,
+			session_id TEXT NOT NULL,
+			type TEXT NOT NULL,
+			title TEXT NOT NULL,
+			content TEXT NOT NULL,
+			tool_name TEXT,
+			project TEXT,
+			scope TEXT NOT NULL DEFAULT 'project',
+			topic_key TEXT,
+			normalized_hash TEXT,
+			revision_count INTEGER NOT NULL DEFAULT 1,
+			duplicate_count INTEGER NOT NULL DEFAULT 1,
+			last_seen_at TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			deleted_at TEXT,
+			FOREIGN KEY (session_id) REFERENCES sessions(id)
+		);
+		CREATE TABLE user_prompts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id TEXT,
+			session_id TEXT NOT NULL,
+			content TEXT NOT NULL,
+			project TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (session_id) REFERENCES sessions(id)
+		);
+		CREATE TABLE sync_state (
+			target_key TEXT PRIMARY KEY,
+			lifecycle TEXT NOT NULL DEFAULT 'idle',
+			last_enqueued_seq INTEGER NOT NULL DEFAULT 0,
+			last_acked_seq INTEGER NOT NULL DEFAULT 0,
+			last_pulled_seq INTEGER NOT NULL DEFAULT 0,
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			backoff_until TEXT,
+			lease_owner TEXT,
+			lease_until TEXT,
+			last_error TEXT,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE sync_mutations (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			target_key TEXT NOT NULL,
+			entity TEXT NOT NULL,
+			entity_key TEXT NOT NULL,
+			op TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			source TEXT NOT NULL DEFAULT 'local',
+			occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+			acked_at TEXT,
+			project TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY (target_key) REFERENCES sync_state(target_key)
+		);
+		CREATE TABLE sync_enrolled_projects (
+			project TEXT PRIMARY KEY,
+			enrolled_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		INSERT INTO sessions (id, project, directory, summary) VALUES ('legacy-session', 'legacy-proj', '/tmp/legacy', 'done');
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
+		VALUES ('obs-legacy', 'legacy-session', 'decision', 'Legacy obs', 'Historical content', 'legacy-proj', 'project', ?, 1, 1, datetime('now'), datetime('now'));
+		INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES ('prompt-legacy', 'legacy-session', 'Historical prompt', 'legacy-proj');
+		INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, 'idle', datetime('now'));
+		INSERT INTO sync_enrolled_projects (project) VALUES ('legacy-proj');
+	`, obsHash, DefaultSyncTargetKey)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("seed legacy db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = dataDir
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store after enrolled legacy state: %v", err)
+	}
+
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		_ = s.Close()
+		t.Fatalf("list pending after repair: %v", err)
+	}
+	if len(mutations) != 3 {
+		_ = s.Close()
+		t.Fatalf("expected 3 repaired mutations, got %d", len(mutations))
+	}
+
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil {
+		_ = s.Close()
+		t.Fatalf("get sync state after repair: %v", err)
+	}
+	if state.LastEnqueuedSeq != 3 {
+		_ = s.Close()
+		t.Fatalf("expected last_enqueued_seq 3 after automatic repair, got %d", state.LastEnqueuedSeq)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close repaired store: %v", err)
+	}
+
+	s, err = New(cfg)
+	if err != nil {
+		t.Fatalf("reopen repaired store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&count); err != nil {
+		t.Fatalf("count repaired mutations after reopen: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected repair to stay idempotent across reopen, got %d sync mutations", count)
 	}
 }
 

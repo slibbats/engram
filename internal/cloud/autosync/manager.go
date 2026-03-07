@@ -43,6 +43,7 @@ type LocalStore interface {
 	GetSyncState(targetKey string) (*store.SyncState, error)
 	ListPendingSyncMutations(targetKey string, limit int) ([]store.SyncMutation, error)
 	AckSyncMutations(targetKey string, lastAckedSeq int64) error
+	AckSyncMutationSeqs(targetKey string, seqs []int64) error
 	SkipAckNonEnrolledMutations(targetKey string) (int64, error)
 	AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error)
 	ReleaseSyncLease(targetKey, owner string) error
@@ -280,27 +281,38 @@ func (m *Manager) push(ctx context.Context) error {
 		return nil
 	}
 
-	// Convert to transport entries.
-	entries := make([]remote.MutationEntry, len(pending))
-	for i, mut := range pending {
-		entries[i] = remote.MutationEntry{
-			Entity:    mut.Entity,
-			EntityKey: mut.EntityKey,
-			Op:        mut.Op,
-			Payload:   json.RawMessage(mut.Payload),
+	groups := make(map[string][]store.SyncMutation)
+	order := make([]string, 0)
+	for _, mut := range pending {
+		project := mut.Project
+		if _, ok := groups[project]; !ok {
+			order = append(order, project)
 		}
+		groups[project] = append(groups[project], mut)
 	}
 
-	result, err := m.transport.PushMutations(entries)
-	if err != nil {
-		return fmt.Errorf("transport push: %w", err)
-	}
+	for _, project := range order {
+		batch := groups[project]
+		entries := make([]remote.MutationEntry, len(batch))
+		seqs := make([]int64, len(batch))
+		for i, mut := range batch {
+			entries[i] = remote.MutationEntry{
+				Entity:    mut.Entity,
+				EntityKey: mut.EntityKey,
+				Op:        mut.Op,
+				Payload:   json.RawMessage(mut.Payload),
+			}
+			seqs[i] = mut.Seq
+		}
 
-	// Ack up to the last local seq we sent.
-	lastLocalSeq := pending[len(pending)-1].Seq
-	_ = result // server returns its own seq; we ack by local seq
-	if err := m.store.AckSyncMutations(m.cfg.TargetKey, lastLocalSeq); err != nil {
-		return fmt.Errorf("ack: %w", err)
+		result, err := m.transport.PushMutations(entries)
+		if err != nil {
+			return fmt.Errorf("transport push project %q: %w", project, err)
+		}
+		_ = result
+		if err := m.store.AckSyncMutationSeqs(m.cfg.TargetKey, seqs); err != nil {
+			return fmt.Errorf("ack project %q: %w", project, err)
+		}
 	}
 
 	return nil

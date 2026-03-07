@@ -50,8 +50,9 @@ engram/
 │   ├── sync/sync.go                # Git sync: manifest + chunks (gzipped JSONL)
 │   ├── cloud/                      # Cloud sync subsystem (Postgres backend)
 │   │   ├── config.go               # Shared Config struct + ConfigFromEnv()
-│   │   ├── cloudstore/             # Postgres storage (schema, CRUD, FTS via tsvector)
+│   │   ├── cloudstore/             # Postgres storage (schema, CRUD, FTS via tsvector, project controls)
 │   │   │   ├── cloudstore.go       # CloudStore struct, user/session/observation/chunk ops
+│   │   │   ├── project_controls.go # Org-managed per-project sync pause/resume policy
 │   │   │   ├── schema.go           # DDL for all cloud_* tables
 │   │   │   └── search.go           # Full-text search (ts_rank_cd + plainto_tsquery)
 │   │   ├── auth/                   # JWT + API key authentication
@@ -104,6 +105,7 @@ engram/
 - **sync_state** — `target_key` (TEXT PK), `lifecycle`, `last_enqueued_seq`, `last_acked_seq`, `last_pulled_seq`, `consecutive_failures`, `backoff_until`, `lease_owner`, `lease_until`, `last_error`, `updated_at` — tracks auto-sync coordination (cursors, lease, backoff)
 - **sync_mutations** — `seq` (INTEGER PK AUTOINCREMENT), `entity`, `entity_key`, `op`, `payload` (JSON), `project` (TEXT), `occurred_at`, `acked_at` — append-only mutation journal for reliable cloud replication. The `project` column is populated at enqueue time from the entity payload.
 - **sync_enrolled_projects** — `project` (TEXT PK), `enrolled_at` — tracks which projects are enrolled for cloud sync. Only mutations belonging to enrolled projects are pushed to the cloud.
+- **cloud_project_controls** — organization-managed sync policy table with `project`, `sync_enabled`, `paused_reason`, `updated_by`, and `updated_at`. Lets admins pause or resume cloud sync per project without changing local enrollment.
 
 ### SQLite Configuration
 
@@ -623,8 +625,18 @@ How it works:
 - API key authentication (`eng_`-prefixed, SHA-256 hashed in storage)
 - Row-level user isolation — every query filters by `user_id`
 - Mutation-based sync (push pending mutations, pull by cursor) — replaces the chunk-based protocol
+- Cloud-managed project controls (`/dashboard/admin/projects`) can pause sync per project with audit metadata
 - Body limit: 50 MB for push requests
 - Retry logic: exponential backoff (3 retries, 500ms base) for 429/5xx errors
+
+**Cloud Project Pause Policy**:
+
+- Project enrollment is still local-only and controls what a client *wants* to sync.
+- Cloud project controls are organization-level policy and control what the server *allows* to sync.
+- Admins can pause or resume a project from the dashboard and store a reason for the decision.
+- When a project is paused, the cloud server rejects pushes for that project and hides its mutations from pull.
+- The dashboard surfaces pause state, reason, updater, and update time in both admin and project-facing views.
+- Autosync now batches pushes by project so one paused project does not block unrelated project mutations in the same local queue.
 
 **Connectivity Contract**:
 
@@ -805,11 +817,11 @@ A server-rendered web UI embedded in the `engram cloud serve` binary. Provides b
 - Dashboard package (`internal/cloud/dashboard/`) receives `CloudStore` and `auth.Service` as dependencies. Mounted on the existing `CloudServer.mux` via `dashboard.Mount()`.
 
 **Tabs**:
-- **Dashboard** — Project enrollment overview with per-project session/observation/prompt counts. Stats loaded via htmx on page load.
-- **Browser** — Knowledge browser with project filter and search. Three sub-views: Observations, Sessions, Prompts. All loaded as htmx partials.
-- **Projects** — Project cards with stats. Click through to project detail (recent sessions, observations, prompts).
-- **Contributors** — Per-user stats table (session count, observation count, last sync time).
-- **Admin** (visible only to admin) — System health, user management, DB diagnostics.
+- **Dashboard** — Shared-memory overview with per-project session/observation/prompt counts. Stats loaded via htmx on page load.
+- **Browser** — Knowledge browser with project filter, type pills, and search. Three sub-views: Observations, Sessions, Prompts, plus connected drill-down pages for observations, sessions, prompts, and contributors.
+- **Projects** — Project cards with stats and pause state. Click through to project detail (recent sessions, observations, prompts, and cloud-managed sync status).
+- **Contributors** — Per-user stats table with drill-down pages showing recent sessions, observations, and prompts for a contributor.
+- **Admin** (visible only to admin) — System health, user management, DB diagnostics, and org-managed project sync controls.
 
 **Admin Configuration**:
 ```bash
@@ -836,7 +848,7 @@ open http://localhost:8080/dashboard/
 # (same username/email + password used with 'engram cloud register')
 ```
 
-**Theme**: Dark theme using Pico CSS (classless) with custom CSS variables. Fully responsive.
+**Theme**: Dark TUI-aligned theme using Pico CSS (classless) with custom CSS variables. Fully responsive, server-rendered, and intentionally aligned with Engram's terminal identity instead of a generic admin panel.
 
 ---
 

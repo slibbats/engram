@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 )
@@ -60,6 +62,45 @@ type pushPrompt struct {
 	Project   string `json:"project,omitempty"`
 }
 
+func (s *CloudServer) ensureLegacyPushProjectsEnabled(req pushRequest) error {
+	seen := map[string]struct{}{}
+	projects := make([]string, 0)
+	for _, sess := range req.Data.Sessions {
+		if project := strings.TrimSpace(sess.Project); project != "" {
+			if _, ok := seen[project]; !ok {
+				seen[project] = struct{}{}
+				projects = append(projects, project)
+			}
+		}
+	}
+	for _, obs := range req.Data.Observations {
+		if project := strings.TrimSpace(obs.Project); project != "" {
+			if _, ok := seen[project]; !ok {
+				seen[project] = struct{}{}
+				projects = append(projects, project)
+			}
+		}
+	}
+	for _, prompt := range req.Data.Prompts {
+		if project := strings.TrimSpace(prompt.Project); project != "" {
+			if _, ok := seen[project]; !ok {
+				seen[project] = struct{}{}
+				projects = append(projects, project)
+			}
+		}
+	}
+	for _, project := range projects {
+		enabled, err := s.store.IsProjectSyncEnabled(project)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			return fmt.Errorf("%w: %s", cloudstore.ErrProjectSyncPaused, project)
+		}
+	}
+	return nil
+}
+
 // ─── Push Handler ───────────────────────────────────────────────────────────
 
 // handlePush receives a sync chunk from a client. It validates the chunk_id
@@ -93,6 +134,14 @@ func (s *CloudServer) handlePush(w http.ResponseWriter, r *http.Request) {
 	// Validate chunk_id format.
 	if !chunkIDRE.MatchString(req.ChunkID) {
 		jsonError(w, http.StatusBadRequest, "chunk_id must be 8 hex characters")
+		return
+	}
+	if err := s.ensureLegacyPushProjectsEnabled(req); err != nil {
+		if errors.Is(err, cloudstore.ErrProjectSyncPaused) {
+			jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeStoreError(w, err, "failed to validate project policy")
 		return
 	}
 
@@ -280,6 +329,10 @@ func (s *CloudServer) handleMutationPush(w http.ResponseWriter, r *http.Request)
 
 	result, err := s.store.AppendMutationBatch(userID, req.Mutations)
 	if err != nil {
+		if errors.Is(err, cloudstore.ErrProjectSyncPaused) {
+			jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeStoreError(w, err, "failed to append mutations: "+err.Error())
 		return
 	}

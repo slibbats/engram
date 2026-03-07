@@ -3,6 +3,7 @@ package cloudstore
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -946,6 +947,59 @@ func TestAppendMutationBatchEmptyIsNoOp(t *testing.T) {
 	}
 }
 
+func TestProjectSyncControlsPauseBatchAndPull(t *testing.T) {
+	cs, userID := testStoreAndUser(t)
+
+	if err := cs.SetProjectSyncEnabled("engram", false, userID, "Security review"); err != nil {
+		t.Fatalf("SetProjectSyncEnabled: %v", err)
+	}
+
+	controls, err := cs.ListProjectSyncControls()
+	if err != nil {
+		t.Fatalf("ListProjectSyncControls: %v", err)
+	}
+	foundPaused := false
+	for _, control := range controls {
+		if control.Project == "engram" && !control.SyncEnabled {
+			foundPaused = true
+			if control.PausedReason == nil || *control.PausedReason != "Security review" {
+				t.Fatalf("expected paused reason to persist, got %+v", control.PausedReason)
+			}
+		}
+	}
+	if !foundPaused {
+		t.Fatal("expected paused project control for engram")
+	}
+
+	_, err = cs.AppendMutationBatch(userID, []PushMutationEntry{{
+		Entity:    "session",
+		EntityKey: "s-paused",
+		Op:        "upsert",
+		Payload:   json.RawMessage(`{"id":"s-paused","project":"engram","directory":"/work"}`),
+	}})
+	if !errors.Is(err, ErrProjectSyncPaused) {
+		t.Fatalf("expected ErrProjectSyncPaused, got %v", err)
+	}
+
+	if _, err := cs.AppendMutation(userID, "session", "s-paused", "upsert", json.RawMessage(`{"id":"s-paused","project":"engram","directory":"/work"}`)); err != nil {
+		t.Fatalf("AppendMutation: %v", err)
+	}
+	if _, err := cs.AppendMutation(userID, "session", "s-open", "upsert", json.RawMessage(`{"id":"s-open","project":"open-proj","directory":"/work"}`)); err != nil {
+		t.Fatalf("AppendMutation open project: %v", err)
+	}
+
+	pulled, err := cs.PullMutations(userID, 0, 10)
+	if err != nil {
+		t.Fatalf("PullMutations: %v", err)
+	}
+	if len(pulled.Mutations) != 1 {
+		t.Fatalf("expected only unpaused mutation, got %d", len(pulled.Mutations))
+	}
+	if pulled.Mutations[0].EntityKey != "s-open" {
+		t.Fatalf("expected s-open mutation, got %s", pulled.Mutations[0].EntityKey)
+	}
+}
+
 func TestPullMutationsUserIsolation(t *testing.T) {
 	cs, userA := testStoreAndUser(t)
 
@@ -995,6 +1049,27 @@ func TestApplyMutationPayloadSession(t *testing.T) {
 	if !found {
 		t.Fatal("session apply-s1 not found after ApplyMutationPayload")
 	}
+}
+
+func TestApplyMutationPayloadSessionAcceptsStringifiedJSON(t *testing.T) {
+	cs, userID := testStoreAndUser(t)
+
+	payload := json.RawMessage(`"{\"id\":\"apply-s2\",\"project\":\"engram\",\"directory\":\"/compat\"}"`)
+	err := cs.ApplyMutationPayload(userID, "session", "upsert", payload)
+	if err != nil {
+		t.Fatalf("ApplyMutationPayload stringified session: %v", err)
+	}
+
+	sessions, err := cs.RecentSessions(userID, "engram", 10)
+	if err != nil {
+		t.Fatalf("RecentSessions: %v", err)
+	}
+	for _, s := range sessions {
+		if s.ID == "apply-s2" {
+			return
+		}
+	}
+	t.Fatal("session apply-s2 not found after stringified ApplyMutationPayload")
 }
 
 func TestApplyMutationPayloadObservation(t *testing.T) {

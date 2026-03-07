@@ -12,6 +12,8 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 )
 
+func strPtr(s string) *string { return &s }
+
 // TestHealthEndpoint verifies GET /dashboard/health returns 200 with JSON.
 func TestHealthEndpoint(t *testing.T) {
 	mux := setupTestMux(t)
@@ -343,7 +345,7 @@ func TestDashboardStatsPartialEmpty(t *testing.T) {
 		t.Fatalf("render error: %v", err)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "No Projects Yet") {
+	if !strings.Contains(body, "No Synced Projects Yet") {
 		t.Fatal("expected empty state message for no stats")
 	}
 }
@@ -370,15 +372,15 @@ func TestDashboardStatsPartialWithData(t *testing.T) {
 	if !strings.Contains(body, "other-project") {
 		t.Fatal("expected project name 'other-project'")
 	}
-	if !strings.Contains(body, "Projects Enrolled") {
-		t.Fatal("expected 'Projects Enrolled' header")
+	if !strings.Contains(body, "Project Activity") {
+		t.Fatal("expected 'Project Activity' heading")
 	}
 }
 
 // TestDashboardHomeRendersHtmxTrigger verifies the htmx stats loader is present.
 func TestDashboardHomeRendersHtmxTrigger(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := DashboardHome("user-123")
+	comp := DashboardHome("gentleman")
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -397,7 +399,7 @@ func TestDashboardHomeRendersHtmxTrigger(t *testing.T) {
 // TestBrowserPageRendersControls verifies the browser page has filter controls.
 func TestBrowserPageRendersControls(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := BrowserPage([]string{"project-a", "project-b"}, "", "")
+	comp := BrowserPage([]string{"project-a", "project-b"}, []string{"bugfix", "session_summary"}, "", "", "bugfix")
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -414,6 +416,9 @@ func TestBrowserPageRendersControls(t *testing.T) {
 	}
 	if !strings.Contains(body, `name="q"`) {
 		t.Fatal("expected search input")
+	}
+	if !strings.Contains(body, "session_summary") {
+		t.Fatal("expected dynamic type pill")
 	}
 	if !strings.Contains(body, "Observations") {
 		t.Fatal("expected Observations subtab")
@@ -531,7 +536,7 @@ func TestPromptsPartialWithData(t *testing.T) {
 // TestProjectsPageEmpty verifies the projects page empty state.
 func TestProjectsPageEmpty(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := ProjectsPage(nil)
+	comp := ProjectsPage(nil, nil)
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -548,7 +553,7 @@ func TestProjectsPageWithData(t *testing.T) {
 		{Project: "engram", SessionCount: 10, ObservationCount: 50, PromptCount: 5, LastActivity: &lastActivity},
 	}
 	rec := httptest.NewRecorder()
-	comp := ProjectsPage(stats)
+	comp := ProjectsPage(stats, map[string]cloudstore.ProjectSyncControl{"engram": {Project: "engram", SyncEnabled: false, PausedReason: strPtr("Security review")}})
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -562,6 +567,9 @@ func TestProjectsPageWithData(t *testing.T) {
 	if !strings.Contains(body, "Sessions") {
 		t.Fatal("expected Sessions stat label")
 	}
+	if !strings.Contains(body, "Paused") {
+		t.Fatal("expected paused badge")
+	}
 }
 
 // TestProjectDetailPage verifies the project detail view renders all sections.
@@ -570,7 +578,7 @@ func TestProjectDetailPage(t *testing.T) {
 	stat := &cloudstore.ProjectStat{Project: "engram", SessionCount: 3, ObservationCount: 15, PromptCount: 2}
 
 	rec := httptest.NewRecorder()
-	comp := ProjectDetailPage(project, stat, nil, nil, nil)
+	comp := ProjectDetailPage(project, stat, &cloudstore.ProjectSyncControl{Project: "engram", SyncEnabled: false, PausedReason: strPtr("Security review"), UpdatedAt: "2025-01-15T10:00:00Z", UpdatedBy: strPtr("gentleman")}, nil, nil, nil)
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -586,6 +594,9 @@ func TestProjectDetailPage(t *testing.T) {
 	}
 	if !strings.Contains(body, "Recent Prompts") {
 		t.Fatal("expected Recent Prompts section")
+	}
+	if !strings.Contains(body, "Security review") {
+		t.Fatal("expected pause reason")
 	}
 }
 
@@ -629,6 +640,97 @@ func TestContributorsPageWithData(t *testing.T) {
 	if !strings.Contains(body, "Never") {
 		t.Fatal("expected 'Never' for bob's nil last sync")
 	}
+	if !strings.Contains(body, "/dashboard/contributors/u1") {
+		t.Fatal("expected contributor detail link")
+	}
+}
+
+func TestPromptDetailPageRendersLinkedSession(t *testing.T) {
+	prompt := &cloudstore.CloudPrompt{ID: 7, SessionID: "sess-7", Content: "How do we sync this?", Project: "engram", CreatedAt: "2025-01-15T10:00:00Z"}
+	session := &cloudstore.CloudSession{ID: "sess-7", Project: "engram", StartedAt: "2025-01-15T09:55:00Z"}
+	related := []cloudstore.CloudPrompt{{ID: 8, SessionID: "sess-7", Content: "What about retries?", Project: "engram", CreatedAt: "2025-01-15T10:05:00Z"}}
+	rec := httptest.NewRecorder()
+	comp := PromptDetailPage(prompt, session, related)
+	if err := comp.Render(context.Background(), rec); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/dashboard/sessions/sess-7") {
+		t.Fatal("expected linked session")
+	}
+	if !strings.Contains(body, "What about retries?") {
+		t.Fatal("expected related prompt")
+	}
+}
+
+func TestContributorDetailPageRendersConnectedData(t *testing.T) {
+	user := &cloudstore.CloudUser{ID: "u1", Username: "alice", Email: "alice@example.com", CreatedAt: "2025-01-15T10:00:00Z"}
+	contributor := &cloudstore.ContributorStat{UserID: "u1", Username: "alice", SessionCount: 5, ObservationCount: 20, LastSync: strPtr("2025-01-15T11:00:00Z")}
+	sessions := []cloudstore.CloudSessionSummary{{ID: "s1", Project: "engram", StartedAt: "2025-01-15T10:00:00Z", ObservationCount: 2}}
+	observations := []cloudstore.CloudObservation{{ID: 1, SessionID: "s1", Title: "Fix sync", Type: "bugfix", CreatedAt: "2025-01-15T10:05:00Z"}}
+	prompts := []cloudstore.CloudPrompt{{ID: 2, SessionID: "s1", Content: "How do we fix sync?", CreatedAt: "2025-01-15T10:06:00Z"}}
+	rec := httptest.NewRecorder()
+	comp := ContributorDetailPage(user, contributor, sessions, observations, prompts)
+	if err := comp.Render(context.Background(), rec); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "alice@example.com") {
+		t.Fatal("expected contributor email")
+	}
+	if !strings.Contains(body, "Fix sync") {
+		t.Fatal("expected observation list")
+	}
+	if !strings.Contains(body, "How do we fix sync?") {
+		t.Fatal("expected prompt list")
+	}
+}
+
+func TestRenderStructuredContentFormatsSections(t *testing.T) {
+	raw := "**What**: Added docs\n\n**Why**: User asked for it"
+	out := renderStructuredContent(raw)
+	if !strings.Contains(out, `<section class="structured-block">`) {
+		t.Fatal("expected structured block wrapper")
+	}
+	if !strings.Contains(out, "<h4>What</h4>") {
+		t.Fatal("expected What heading")
+	}
+	if !strings.Contains(out, "Added docs") {
+		t.Fatal("expected What content")
+	}
+}
+
+func TestRenderInlineStructuredPreviewFlattensStructuredMemory(t *testing.T) {
+	raw := "**What**: Added docs\n\n**Why**: User asked for it"
+	preview := renderInlineStructuredPreview(raw, 120)
+	if !strings.Contains(preview, "What: Added docs") {
+		t.Fatal("expected flattened What preview")
+	}
+	if !strings.Contains(preview, "Why: User asked for it") {
+		t.Fatal("expected flattened Why preview")
+	}
+}
+
+func TestRenderStructuredContentFormatsHeadingSections(t *testing.T) {
+	raw := "## Goal\nFix sync\n\n## Instructions\nKeep local-first\n\n## Discoveries\n- Backfill was missing"
+	out := renderStructuredContent(raw)
+	if !strings.Contains(out, "<h4>Goal</h4>") {
+		t.Fatal("expected Goal heading")
+	}
+	if !strings.Contains(out, "Keep local-first") {
+		t.Fatal("expected Instructions content")
+	}
+}
+
+func TestRenderInlineStructuredPreviewFlattensHeadingSections(t *testing.T) {
+	raw := "## Goal\nFix sync\n\n## Instructions\nKeep local-first"
+	preview := renderInlineStructuredPreview(raw, 160)
+	if !strings.Contains(preview, "Goal: Fix sync") {
+		t.Fatal("expected flattened Goal preview")
+	}
+	if !strings.Contains(preview, "Instructions: Keep local-first") {
+		t.Fatal("expected flattened Instructions preview")
+	}
 }
 
 // ─── Phase 8: Admin Views ───────────────────────────────────────────────────
@@ -644,7 +746,7 @@ func TestAdminPageRendersHealth(t *testing.T) {
 		TotalMutations: 200,
 	}
 	rec := httptest.NewRecorder()
-	comp := AdminPage(health)
+	comp := AdminPage(health, []cloudstore.ProjectSyncControl{{Project: "engram", SyncEnabled: false}})
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -767,8 +869,12 @@ func TestUnauthenticatedBrowserRedirects(t *testing.T) {
 		"/dashboard/browser/observations",
 		"/dashboard/browser/sessions",
 		"/dashboard/browser/prompts",
+		"/dashboard/sessions/test-session",
+		"/dashboard/observations/42",
+		"/dashboard/prompts/42",
 		"/dashboard/projects",
 		"/dashboard/contributors",
+		"/dashboard/contributors/test-user",
 		"/dashboard/admin",
 		"/dashboard/admin/users",
 		"/dashboard/admin/health",
@@ -1091,7 +1197,7 @@ func TestHealthEndpointResponseJSON(t *testing.T) {
 // TestDashboardHomeComponent verifies DashboardHome renders user-specific content.
 func TestDashboardHomeComponent(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := DashboardHome("unique-user-id")
+	comp := DashboardHome("gentleman")
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -1100,12 +1206,15 @@ func TestDashboardHomeComponent(t *testing.T) {
 	if !strings.Contains(body, "hx-get") {
 		t.Fatal("expected hx-get attribute in DashboardHome")
 	}
+	if !strings.Contains(body, "MEMORY FABRIC / OPERATOR gentleman") {
+		t.Fatal("expected username-oriented hero copy")
+	}
 }
 
 // TestBrowserPageSelectedProject verifies the browser page marks selected project.
 func TestBrowserPageSelectedProject(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := BrowserPage([]string{"proj-a", "proj-b"}, "proj-a", "search-term")
+	comp := BrowserPage([]string{"proj-a", "proj-b"}, []string{"bugfix", "decision"}, "proj-a", "search-term", "bugfix")
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -1115,6 +1224,49 @@ func TestBrowserPageSelectedProject(t *testing.T) {
 	}
 	if !strings.Contains(body, "search-term") {
 		t.Fatal("expected search-term as value in search input")
+	}
+	if !strings.Contains(body, "type-pill active") {
+		t.Fatal("expected active type pill")
+	}
+}
+
+// TestSessionDetailPageRendersConnectedData verifies session detail includes observations and prompts.
+func TestSessionDetailPageRendersConnectedData(t *testing.T) {
+	session := &cloudstore.CloudSession{ID: "sess-1", Project: "engram", Directory: "/tmp/engram", StartedAt: "2025-01-15T10:00:00Z"}
+	observations := []cloudstore.CloudObservation{{ID: 11, SessionID: "sess-1", Title: "Fix sync", Type: "bugfix", CreatedAt: "2025-01-15T10:01:00Z"}}
+	prompts := []cloudstore.CloudPrompt{{ID: 22, SessionID: "sess-1", Content: "how do we drain backlog?", CreatedAt: "2025-01-15T10:02:00Z"}}
+
+	rec := httptest.NewRecorder()
+	comp := SessionDetailPage(session, observations, prompts)
+	if err := comp.Render(context.Background(), rec); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Fix sync") {
+		t.Fatal("expected observation in session detail")
+	}
+	if !strings.Contains(body, "drain backlog") {
+		t.Fatal("expected prompt in session detail")
+	}
+}
+
+// TestObservationDetailPageLinksBackToSession verifies observation detail keeps navigation connected.
+func TestObservationDetailPageLinksBackToSession(t *testing.T) {
+	obs := &cloudstore.CloudObservation{ID: 7, SessionID: "sess-7", Type: "bugfix", Title: "Payload mismatch", Content: "Full payload body", Scope: "project", CreatedAt: "2025-01-15T10:00:00Z", UpdatedAt: "2025-01-15T10:05:00Z", RevisionCount: 1, DuplicateCount: 1}
+	session := &cloudstore.CloudSession{ID: "sess-7", Project: "engram", StartedAt: "2025-01-15T09:55:00Z"}
+	related := []cloudstore.CloudObservation{{ID: 8, SessionID: "sess-7", Title: "Repair journal", Type: "decision", CreatedAt: "2025-01-15T10:06:00Z"}}
+
+	rec := httptest.NewRecorder()
+	comp := ObservationDetailPage(obs, session, related)
+	if err := comp.Render(context.Background(), rec); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/dashboard/sessions/sess-7") {
+		t.Fatal("expected link back to session")
+	}
+	if !strings.Contains(body, "Repair journal") {
+		t.Fatal("expected related observation")
 	}
 }
 
@@ -1133,7 +1285,7 @@ func TestProjectDetailPageWithAllData(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	comp := ProjectDetailPage(project, stat, sessions, obs, prompts)
+	comp := ProjectDetailPage(project, stat, nil, sessions, obs, prompts)
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -1152,13 +1304,32 @@ func TestProjectDetailPageWithAllData(t *testing.T) {
 // TestAdminPageNilHealth verifies admin page handles nil health gracefully.
 func TestAdminPageNilHealth(t *testing.T) {
 	rec := httptest.NewRecorder()
-	comp := AdminPage(nil)
+	comp := AdminPage(nil, nil)
 	if err := comp.Render(context.Background(), rec); err != nil {
 		t.Fatalf("render error: %v", err)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "Admin") {
 		t.Fatal("expected Admin heading even with nil health")
+	}
+}
+
+func TestAdminProjectsPageShowsReasonAndUpdater(t *testing.T) {
+	rec := httptest.NewRecorder()
+	controls := []cloudstore.ProjectSyncControl{{Project: "engram", SyncEnabled: false, PausedReason: strPtr("Security hold"), UpdatedBy: strPtr("gentleman"), UpdatedAt: "2025-01-15T10:00:00Z"}}
+	comp := AdminProjectsPage(controls)
+	if err := comp.Render(context.Background(), rec); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Security hold") {
+		t.Fatal("expected paused reason")
+	}
+	if !strings.Contains(body, "gentleman") {
+		t.Fatal("expected updater name")
+	}
+	if !strings.Contains(body, "Reason when pausing") {
+		t.Fatal("expected reason input")
 	}
 }
 

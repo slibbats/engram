@@ -85,6 +85,16 @@ CREATE INDEX IF NOT EXISTS idx_cloud_prompts_user_session ON cloud_prompts(user_
 CREATE INDEX IF NOT EXISTS idx_cloud_prompts_user_project ON cloud_prompts(user_id, project);
 CREATE INDEX IF NOT EXISTS idx_cloud_prompts_tsv          ON cloud_prompts USING GIN(tsv);
 
+-- ── Project Controls (cloud-managed sync policy) ─────────────────────────
+CREATE TABLE IF NOT EXISTS cloud_project_controls (
+    project      TEXT PRIMARY KEY,
+    sync_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    paused_reason TEXT,
+    updated_by   UUID REFERENCES cloud_users(id) ON DELETE SET NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_project_controls_enabled ON cloud_project_controls(sync_enabled);
+
 -- ── Chunks (raw chunk storage for sync) ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS cloud_chunks (
     chunk_id    TEXT NOT NULL,

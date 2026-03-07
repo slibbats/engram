@@ -30,7 +30,7 @@ func LoginPage(errorMsg string) templ.Component {
 			templ_7745c5c3_Var1 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<!doctype html><html lang=\"en\" data-theme=\"dark\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Login — Engram Cloud</title><link rel=\"stylesheet\" href=\"/dashboard/static/pico.min.css\"><link rel=\"stylesheet\" href=\"/dashboard/static/styles.css\"></head><body><main><div class=\"login-container\"><h1>Engram Cloud</h1>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<!doctype html><html lang=\"en\" data-theme=\"dark\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Login — Engram Cloud</title><link rel=\"stylesheet\" href=\"/dashboard/static/pico.min.css\"><link rel=\"stylesheet\" href=\"/dashboard/static/styles.css\"></head><body class=\"shell-body\"><div class=\"shell-backdrop\"><main class=\"login-shell\"><section class=\"login-sidepanel\"><p class=\"section-kicker\">CLOUD ACTIVE</p><h1>Engram Cloud</h1><p class=\"login-lead\">Bring Engram memory into a shared browser workspace without losing the local-first model.</p><div class=\"hero-console login-console\"><p><span class=\"console-key\">mode</span> enterprise</p><p><span class=\"console-key\">sync</span> local-first / cloud policy aware</p><p><span class=\"console-key\">surface</span> shared memory for humans + agents</p></div></section><section class=\"login-container\"><p class=\"section-kicker\">SIGN IN</p><h2>Sign In</h2><p class=\"login-copy\">Use the account created with <code>engram cloud register</code> or refreshed with <code>engram cloud login</code>.</p>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -42,7 +42,7 @@ func LoginPage(errorMsg string) templ.Component {
 			var templ_7745c5c3_Var2 string
 			templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(errorMsg)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `login.templ`, Line: 20, Col: 17}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/cloud/dashboard/login.templ`, Line: 33, Col: 18}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 			if templ_7745c5c3_Err != nil {
@@ -53,7 +53,7 @@ func LoginPage(errorMsg string) templ.Component {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "<form method=\"post\" action=\"/dashboard/login\"><label>Username or Email <input type=\"text\" name=\"identifier\" placeholder=\"username or email\" required autofocus></label> <label>Password <input type=\"password\" name=\"password\" placeholder=\"password\" required></label> <button type=\"submit\">Sign In</button></form></div></main></body></html>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "<form method=\"post\" action=\"/dashboard/login\" class=\"login-form\"><label>Username or Email <input type=\"text\" name=\"identifier\" placeholder=\"username or email\" required autofocus></label> <label>Password <input type=\"password\" name=\"password\" placeholder=\"password\" required></label> <button type=\"submit\" class=\"shell-button\">Sign In</button></form></section></main></div></body></html>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

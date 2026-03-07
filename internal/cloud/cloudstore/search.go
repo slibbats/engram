@@ -22,6 +22,42 @@ type CloudSearchResult struct {
 	Rank float64 `json:"rank"` // ts_rank_cd score
 }
 
+// ObservationTypes returns the distinct observation types currently present for
+// a user, optionally filtered by project, ordered by frequency and then name.
+func (cs *CloudStore) ObservationTypes(userID, project string) ([]string, error) {
+	query := `
+		SELECT type
+		FROM cloud_observations
+		WHERE user_id = $1 AND deleted_at IS NULL AND type <> ''
+	`
+	args := []any{userID}
+	argN := 2
+
+	if project != "" {
+		query += fmt.Sprintf(" AND project = $%d", argN)
+		args = append(args, project)
+		argN++
+	}
+
+	query += ` GROUP BY type ORDER BY COUNT(*) DESC, type ASC`
+
+	rows, err := cs.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: observation types: %w", err)
+	}
+	defer rows.Close()
+
+	var types []string
+	for rows.Next() {
+		var obsType string
+		if err := rows.Scan(&obsType); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan observation type: %w", err)
+		}
+		types = append(types, obsType)
+	}
+	return types, rows.Err()
+}
+
 // ─── Query Sanitization ─────────────────────────────────────────────────────
 
 // safeCharsRE strips everything except letters, digits, spaces, and the

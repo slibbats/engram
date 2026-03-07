@@ -1342,6 +1342,29 @@ func TestMutationPushInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestMutationPushReturnsConflictWhenProjectPaused(t *testing.T) {
+	srv, _ := testSetup(t)
+	h := srv.Handler()
+
+	result := registerUser(t, h, "mutpaused", "mutpaused@test.com", "password123")
+	if err := srv.store.SetProjectSyncEnabled("engram", false, result.UserID, "Security hold"); err != nil {
+		t.Fatalf("SetProjectSyncEnabled: %v", err)
+	}
+
+	body := `{
+		"mutations": [
+			{"entity":"session","entity_key":"s1","op":"upsert","payload":{"id":"s1","project":"engram","directory":"/work"}}
+		]
+	}`
+	req := authReq(http.MethodPost, "/sync/mutations/push", body, result.AccessToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestMutationPushNoAuth(t *testing.T) {
 	srv, _ := testSetup(t)
 	h := srv.Handler()
@@ -1431,6 +1454,13 @@ func TestMutationPullReturnsAfterCursor(t *testing.T) {
 	}
 	if len(mutations) != 3 {
 		t.Fatalf("expected 3 mutations, got %d", len(mutations))
+	}
+	firstPayload, ok := mutations[0].(map[string]any)["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first payload object, got %T", mutations[0].(map[string]any)["payload"])
+	}
+	if firstPayload["id"] != "s1" {
+		t.Fatalf("expected first payload id s1, got %v", firstPayload["id"])
 	}
 
 	// Extract the seq of the first mutation, then pull since that seq

@@ -104,6 +104,33 @@ func (fs *fakeStore) AckSyncMutations(targetKey string, lastAckedSeq int64) erro
 	return nil
 }
 
+func (fs *fakeStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.ackCount++
+	if fs.ackErr != nil {
+		return fs.ackErr
+	}
+	acked := map[int64]struct{}{}
+	for _, seq := range seqs {
+		acked[seq] = struct{}{}
+		if seq > fs.lastAckedSeq {
+			fs.lastAckedSeq = seq
+		}
+	}
+	var remaining []store.SyncMutation
+	for _, m := range fs.mutations {
+		if _, ok := acked[m.Seq]; !ok {
+			remaining = append(remaining, m)
+		}
+	}
+	fs.mutations = remaining
+	if len(fs.mutations) == 0 {
+		fs.syncState.Lifecycle = store.SyncLifecycleHealthy
+	}
+	return nil
+}
+
 func (fs *fakeStore) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -198,10 +225,11 @@ func (fs *fakeStore) setPending(mutations []store.SyncMutation) {
 type fakeTransport struct {
 	mu sync.Mutex
 
-	pushResult *remote.PushMutationsResult
-	pushErr    error
-	pushCount  int
-	lastPushed []remote.MutationEntry
+	pushResult  *remote.PushMutationsResult
+	pushErr     error
+	pushCount   int
+	lastPushed  []remote.MutationEntry
+	pushBatches [][]remote.MutationEntry
 
 	pullResult    *remote.PullMutationsResponse
 	pullErr       error
@@ -221,6 +249,8 @@ func (ft *fakeTransport) PushMutations(mutations []remote.MutationEntry) (*remot
 	defer ft.mu.Unlock()
 	ft.pushCount++
 	ft.lastPushed = mutations
+	batch := append([]remote.MutationEntry(nil), mutations...)
+	ft.pushBatches = append(ft.pushBatches, batch)
 	if ft.pushErr != nil {
 		return nil, ft.pushErr
 	}
@@ -1183,6 +1213,51 @@ func TestDegradedStateMessagingOnPushFailure(t *testing.T) {
 	}
 	if storeFailures < 1 {
 		t.Errorf("expected store to track failures, got %d", storeFailures)
+	}
+}
+
+func TestPushGroupsMixedProjectsSeparately(t *testing.T) {
+	fs := newFakeStore()
+	ft := newFakeTransport()
+	m := newTestManager(fs, ft)
+
+	mutA := makeMutation(1, "session", "s1", "upsert")
+	mutA.Project = "proj-a"
+	mutB := makeMutation(2, "session", "s2", "upsert")
+	mutB.Project = "proj-b"
+	mutC := makeMutation(3, "observation", "o3", "upsert")
+	mutC.Project = "proj-a"
+	fs.setPending([]store.SyncMutation{mutA, mutB, mutC})
+	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 10}
+
+	if err := m.push(context.Background()); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	ft.mu.Lock()
+	batchCount := len(ft.pushBatches)
+	first := ft.pushBatches[0]
+	second := ft.pushBatches[1]
+	ft.mu.Unlock()
+	if batchCount != 2 {
+		t.Fatalf("expected 2 project batches, got %d", batchCount)
+	}
+	if len(first) != 2 || first[0].EntityKey != "s1" || first[1].EntityKey != "o3" {
+		t.Fatalf("unexpected first batch: %+v", first)
+	}
+	if len(second) != 1 || second[0].EntityKey != "s2" {
+		t.Fatalf("unexpected second batch: %+v", second)
+	}
+
+	fs.mu.Lock()
+	remaining := len(fs.mutations)
+	acked := fs.lastAckedSeq
+	fs.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected all mutations acked, got %d remaining", remaining)
+	}
+	if acked != 3 {
+		t.Fatalf("expected max acked seq 3, got %d", acked)
 	}
 }
 
