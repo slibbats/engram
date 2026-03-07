@@ -8,6 +8,11 @@ description: "ALWAYS ACTIVE — Persistent memory protocol. You MUST save decisi
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
 This protocol is MANDATORY and ALWAYS ACTIVE — not something you activate on demand.
 
+## FIRST ACTION (session start)
+
+Memory tools are deferred and must be loaded before use. At the start of every session, call ToolSearch with:
+`select:mcp__plugin_engram_engram__mem_save,mcp__plugin_engram_engram__mem_context,mcp__plugin_engram_engram__mem_search,mcp__plugin_engram_engram__mem_session_summary`
+
 ## PROACTIVE SAVE TRIGGERS (mandatory — do NOT wait for user to ask)
 
 Call `mem_save` IMMEDIATELY and WITHOUT BEING ASKED after any of these:
