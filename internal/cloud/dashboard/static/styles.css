@@ -598,6 +598,19 @@ label,
 	margin-bottom: 1rem;
 }
 
+form.browser-controls {
+	grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+	align-items: start;
+}
+
+form.browser-controls button[type="submit"] {
+	width: auto;
+	min-width: 8rem;
+	margin: 0;
+	justify-self: start;
+	align-self: start;
+}
+
 .browser-controls > :only-child {
 	grid-column: 1 / -1;
 }
