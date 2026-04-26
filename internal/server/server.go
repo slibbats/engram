@@ -42,6 +42,9 @@ type SyncStatus struct {
 	UpgradeStage         string     `json:"upgrade_stage,omitempty"`
 	UpgradeReasonCode    string     `json:"upgrade_reason_code,omitempty"`
 	UpgradeReasonMessage string     `json:"upgrade_reason_message,omitempty"`
+	// Phase 2: deferred relation retry counts surfaced from sync_apply_deferred.
+	DeferredCount int `json:"deferred_count"`
+	DeadCount     int `json:"dead_count"`
 }
 
 type Server struct {
@@ -590,6 +593,8 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		"last_sync_at":         status.LastSyncAt,
 		"reason_code":          status.ReasonCode,
 		"reason_message":       status.ReasonMessage,
+		"deferred_count":       status.DeferredCount,
+		"dead_count":           status.DeadCount,
 		"upgrade": map[string]any{
 			"stage":          status.UpgradeStage,
 			"reason_code":    status.UpgradeReasonCode,

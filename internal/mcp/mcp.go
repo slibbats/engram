@@ -836,21 +836,47 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 				preview,
 				r.CreatedAt, projectDisplay, r.Scope)
 
-			// Append relation annotations (REQ-002). Skip orphaned (filtered by store).
+			// Append relation annotations. Skip orphaned (filtered by store).
+			//
+			// Annotation format contract (REQ-012, Design §7):
+			//   supersedes: #<id> (<title>)            judged supersedes
+			//   superseded_by: #<id> (<title>)         judged superseded_by
+			//   conflicts: #<id> (<title>)             judged conflicts_with
+			//   conflict: contested by #<id> (pending) pending (UNCHANGED from Phase 1)
+			//
+			// <id> is the observation's integer primary key. <title> is the related
+			// observation's title; "(deleted)" when the observation is missing or soft-deleted.
+			// Prefixes (supersedes:, superseded_by:, conflicts:) are stable across Phase 3.
 			if rels, ok := relationsMap[r.SyncID]; ok {
 				for _, rel := range rels.AsSource {
-					switch rel.Relation {
-					case store.RelationSupersedes:
-						fmt.Fprintf(&b, "    supersedes: #%s\n", rel.TargetID)
-					case store.RelationPending:
+					switch {
+					case rel.Relation == store.RelationSupersedes && rel.JudgmentStatus == store.JudgmentStatusJudged:
+						title := rel.TargetTitle
+						if rel.TargetMissing || title == "" {
+							title = "deleted"
+						}
+						fmt.Fprintf(&b, "    supersedes: #%d (%s)\n", rel.TargetIntID, title)
+					case rel.Relation == store.RelationConflictsWith && rel.JudgmentStatus == store.JudgmentStatusJudged:
+						title := rel.TargetTitle
+						if rel.TargetMissing || title == "" {
+							title = "deleted"
+						}
+						fmt.Fprintf(&b, "    conflicts: #%d (%s)\n", rel.TargetIntID, title)
+					case rel.JudgmentStatus == store.JudgmentStatusPending:
+						// UNCHANGED from Phase 1 — byte-for-byte preserved.
 						fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.TargetID)
 					}
 				}
 				for _, rel := range rels.AsTarget {
-					switch rel.Relation {
-					case store.RelationSupersedes:
-						fmt.Fprintf(&b, "    superseded_by: #%s\n", rel.SourceID)
-					case store.RelationPending:
+					switch {
+					case rel.Relation == store.RelationSupersedes && rel.JudgmentStatus == store.JudgmentStatusJudged:
+						title := rel.SourceTitle
+						if rel.SourceMissing || title == "" {
+							title = "deleted"
+						}
+						fmt.Fprintf(&b, "    superseded_by: #%d (%s)\n", rel.SourceIntID, title)
+					case rel.JudgmentStatus == store.JudgmentStatusPending:
+						// UNCHANGED from Phase 1 — byte-for-byte preserved.
 						fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.SourceID)
 					}
 				}

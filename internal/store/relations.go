@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -101,6 +102,16 @@ type Relation struct {
 	SessionID             *string  `json:"session_id,omitempty"`
 	CreatedAt             string   `json:"created_at"`
 	UpdatedAt             string   `json:"updated_at"`
+
+	// Annotation fields — populated by GetRelationsForObservations via LEFT JOIN.
+	// Excluded from JSON output (used only for in-process annotation building).
+	// REQ-005, REQ-012 | Design §7, §8.
+	SourceIntID     int64  `json:"-"` // integer primary key of source observation
+	SourceTitle     string `json:"-"` // title of source observation; empty if missing/deleted
+	SourceMissing   bool   `json:"-"` // true if source is soft-deleted or not found
+	TargetIntID     int64  `json:"-"` // integer primary key of target observation
+	TargetTitle     string `json:"-"` // title of target observation; empty if missing/deleted
+	TargetMissing   bool   `json:"-"` // true if target is soft-deleted or not found
 }
 
 // ObservationRelations groups relations for a single observation, split by role.
@@ -334,21 +345,26 @@ func (s *Store) GetRelation(syncID string) (*Relation, error) {
 // Re-judge policy: OVERWRITE the existing row (design decision). The updated row
 // is returned on success.
 //
+// Phase 2: wraps the UPDATE in a transaction to atomically enqueue a sync
+// mutation when the source observation's project is enrolled for cloud sync.
+// Returns ErrCrossProjectRelation if source and target belong to different projects.
+//
 // Returns an error if the judgment_id is unknown or the relation verb is invalid.
 func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 	if !isValidRelationVerb(p.Relation) {
 		return nil, fmt.Errorf("JudgeRelation: invalid relation verb %q — must be one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict", p.Relation)
 	}
 
-	// Verify the relation exists.
-	var exists int
+	// Verify the relation exists and fetch source/target IDs for project check.
+	var sourceID, targetID string
 	if err := s.db.QueryRow(
-		`SELECT count(*) FROM memory_relations WHERE sync_id = ?`, p.JudgmentID,
-	).Scan(&exists); err != nil {
+		`SELECT ifnull(source_id,''), ifnull(target_id,'') FROM memory_relations WHERE sync_id = ?`,
+		p.JudgmentID,
+	).Scan(&sourceID, &targetID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("JudgeRelation: relation %q not found", p.JudgmentID)
+		}
 		return nil, fmt.Errorf("JudgeRelation: check existence: %w", err)
-	}
-	if exists == 0 {
-		return nil, fmt.Errorf("JudgeRelation: relation %q not found", p.JudgmentID)
 	}
 
 	// Build nullable model string.
@@ -361,35 +377,139 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 		sessionID = &p.SessionID
 	}
 
-	_, err := s.db.Exec(`
-		UPDATE memory_relations
-		SET relation        = ?,
-		    reason          = ?,
-		    evidence        = ?,
-		    confidence      = ?,
-		    judgment_status = 'judged',
-		    marked_by_actor = ?,
-		    marked_by_kind  = ?,
-		    marked_by_model = ?,
-		    session_id      = ?,
-		    updated_at      = datetime('now')
-		WHERE sync_id = ?
-	`,
-		p.Relation,
-		p.Reason,
-		p.Evidence,
-		p.Confidence,
-		p.MarkedByActor,
-		p.MarkedByKind,
-		markedByModel,
-		sessionID,
-		p.JudgmentID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("JudgeRelation: update: %w", err)
+	if err := s.withTx(func(tx *sql.Tx) error {
+		// ── Cross-project guard (Phase 2, REQ-003) ─────────────────────────
+		// Derive source and target project. Missing observation → empty string.
+		var srcProject, tgtProject string
+		_ = tx.QueryRow(
+			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, sourceID,
+		).Scan(&srcProject)
+		_ = tx.QueryRow(
+			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, targetID,
+		).Scan(&tgtProject)
+
+		// Reject cross-project relations at write time. Both empty is allowed
+		// (source or target observation simply missing locally — REQ-011 edge).
+		if srcProject != "" && tgtProject != "" && srcProject != tgtProject {
+			return ErrCrossProjectRelation
+		}
+
+		// ── UPDATE memory_relations ────────────────────────────────────────
+		if _, err := s.execHook(tx, `
+			UPDATE memory_relations
+			SET relation        = ?,
+			    reason          = ?,
+			    evidence        = ?,
+			    confidence      = ?,
+			    judgment_status = 'judged',
+			    marked_by_actor = ?,
+			    marked_by_kind  = ?,
+			    marked_by_model = ?,
+			    session_id      = ?,
+			    updated_at      = datetime('now')
+			WHERE sync_id = ?
+		`,
+			p.Relation,
+			p.Reason,
+			p.Evidence,
+			p.Confidence,
+			p.MarkedByActor,
+			p.MarkedByKind,
+			markedByModel,
+			sessionID,
+			p.JudgmentID,
+		); err != nil {
+			return fmt.Errorf("JudgeRelation: update: %w", err)
+		}
+
+		// ── Enqueue sync mutation when project is enrolled (REQ-001) ───────
+		// Derive project from source observation; empty string if source missing.
+		// (REQ-011: loud failure is the server's job; we enqueue project='' and log.)
+		//
+		// Enrollment check: prefer srcProject; fall back to tgtProject when source
+		// is missing locally (race condition). This ensures enqueue happens with
+		// project='' when source is absent but target's project IS enrolled.
+		enrollCheckProject := srcProject
+		if enrollCheckProject == "" {
+			enrollCheckProject = tgtProject
+		}
+		var enrolled int
+		if err := tx.QueryRow(
+			`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, enrollCheckProject,
+		).Scan(&enrolled); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("JudgeRelation: check enrollment: %w", err)
+		}
+		if enrolled == 0 {
+			return nil // not enrolled — no mutation enqueued
+		}
+
+		// REQ-011: log at WARNING level when source observation is missing locally
+		// (project='' race condition). The server will reject with 400; this log
+		// is the local breadcrumb so the gap is not silently swallowed.
+		if srcProject == "" {
+			log.Printf("[store] WARNING: JudgeRelation enqueueing relation %s with project='' (source observation missing locally); server will reject", p.JudgmentID)
+		}
+
+		// Read the full updated row to build the payload.
+		rel, err := s.getRelationTx(tx, p.JudgmentID)
+		if err != nil {
+			return fmt.Errorf("JudgeRelation: read updated relation: %w", err)
+		}
+
+		payload := syncRelationPayload{
+			SyncID:         rel.SyncID,
+			SourceID:       rel.SourceID,
+			TargetID:       rel.TargetID,
+			Relation:       rel.Relation,
+			Reason:         rel.Reason,
+			Evidence:       rel.Evidence,
+			Confidence:     rel.Confidence,
+			JudgmentStatus: rel.JudgmentStatus,
+			MarkedByActor:  rel.MarkedByActor,
+			MarkedByKind:   rel.MarkedByKind,
+			MarkedByModel:  rel.MarkedByModel,
+			SessionID:      rel.SessionID,
+			Project:        srcProject,
+			CreatedAt:      rel.CreatedAt,
+			UpdatedAt:      rel.UpdatedAt,
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntityRelation, rel.SyncID, SyncOpUpsert, payload)
+	}); err != nil {
+		return nil, err
 	}
 
 	return s.GetRelation(p.JudgmentID)
+}
+
+// getRelationTx is the transactional variant of GetRelation used within
+// JudgeRelation to read the freshly-updated row before commit.
+func (s *Store) getRelationTx(tx *sql.Tx, syncID string) (*Relation, error) {
+	row := tx.QueryRow(`
+		SELECT id, sync_id,
+		       ifnull(source_id,''), ifnull(target_id,''),
+		       relation, reason, evidence, confidence, judgment_status,
+		       marked_by_actor, marked_by_kind, marked_by_model,
+		       session_id, created_at, updated_at
+		FROM memory_relations
+		WHERE sync_id = ?
+	`, syncID)
+
+	var r Relation
+	var sourceID, targetID string
+	if err := row.Scan(
+		&r.ID, &r.SyncID,
+		&sourceID, &targetID,
+		&r.Relation, &r.Reason, &r.Evidence, &r.Confidence, &r.JudgmentStatus,
+		&r.MarkedByActor, &r.MarkedByKind, &r.MarkedByModel,
+		&r.SessionID, &r.CreatedAt, &r.UpdatedAt,
+	); err == sql.ErrNoRows {
+		return nil, fmt.Errorf("getRelationTx: relation %q not found", syncID)
+	} else if err != nil {
+		return nil, fmt.Errorf("getRelationTx: %w", err)
+	}
+	r.SourceID = sourceID
+	r.TargetID = targetID
+	return &r, nil
 }
 
 // ─── GetRelationsForObservations ──────────────────────────────────────────────
@@ -398,7 +518,10 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 // ObservationRelations for all observations in syncIDs. Relations with
 // judgment_status='orphaned' are excluded.
 //
-// A single SQL query with IN/OR avoids N+1 queries.
+// A single SQL query with IN/OR and LEFT JOINs avoids N+1 queries.
+// The returned Relation values are enriched with source/target integer IDs and
+// titles via LEFT JOIN, used by the MCP annotation builder (REQ-005, REQ-012).
+// Missing or soft-deleted observations set the corresponding *Missing flag to true.
 func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]ObservationRelations, error) {
 	if len(syncIDs) == 0 {
 		return map[string]ObservationRelations{}, nil
@@ -416,15 +539,25 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 	}
 
 	inClause := joinStrings(placeholders, ",")
+	// LEFT JOIN to observations for title enrichment (REQ-005, Design §8).
+	// source_missing / target_missing: observation is absent (not found) or soft-deleted.
 	query := fmt.Sprintf(`
-		SELECT id, sync_id,
-		       ifnull(source_id,''), ifnull(target_id,''),
-		       relation, reason, evidence, confidence, judgment_status,
-		       marked_by_actor, marked_by_kind, marked_by_model,
-		       session_id, created_at, updated_at
-		FROM memory_relations
-		WHERE (source_id IN (%s) OR target_id IN (%s))
-		  AND judgment_status != 'orphaned'
+		SELECT r.id, r.sync_id,
+		       ifnull(r.source_id,''), ifnull(r.target_id,''),
+		       r.relation, r.reason, r.evidence, r.confidence, r.judgment_status,
+		       r.marked_by_actor, r.marked_by_kind, r.marked_by_model,
+		       r.session_id, r.created_at, r.updated_at,
+		       ifnull(src.id,0)              AS source_int_id,
+		       ifnull(src.title,'')          AS source_title,
+		       (src.id IS NULL OR src.deleted_at IS NOT NULL) AS source_missing,
+		       ifnull(tgt.id,0)              AS target_int_id,
+		       ifnull(tgt.title,'')          AS target_title,
+		       (tgt.id IS NULL OR tgt.deleted_at IS NOT NULL) AS target_missing
+		FROM memory_relations r
+		LEFT JOIN observations src ON src.sync_id = r.source_id
+		LEFT JOIN observations tgt ON tgt.sync_id = r.target_id
+		WHERE (r.source_id IN (%s) OR r.target_id IN (%s))
+		  AND r.judgment_status != 'orphaned'
 	`, inClause, inClause)
 
 	rows, err := s.db.Query(query, args...)
@@ -438,17 +571,23 @@ func (s *Store) GetRelationsForObservations(syncIDs []string) (map[string]Observ
 	for rows.Next() {
 		var r Relation
 		var sourceID, targetID string
+		// SQLite BOOLEAN → int; use int for missing flags.
+		var sourceMissingInt, targetMissingInt int
 		if err := rows.Scan(
 			&r.ID, &r.SyncID,
 			&sourceID, &targetID,
 			&r.Relation, &r.Reason, &r.Evidence, &r.Confidence, &r.JudgmentStatus,
 			&r.MarkedByActor, &r.MarkedByKind, &r.MarkedByModel,
 			&r.SessionID, &r.CreatedAt, &r.UpdatedAt,
+			&r.SourceIntID, &r.SourceTitle, &sourceMissingInt,
+			&r.TargetIntID, &r.TargetTitle, &targetMissingInt,
 		); err != nil {
 			return nil, fmt.Errorf("GetRelationsForObservations: scan: %w", err)
 		}
 		r.SourceID = sourceID
 		r.TargetID = targetID
+		r.SourceMissing = sourceMissingInt != 0
+		r.TargetMissing = targetMissingInt != 0
 
 		// Index by source_id.
 		for _, id := range syncIDs {

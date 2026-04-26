@@ -715,3 +715,41 @@ func TestHandleDeletePrompt_BadID(t *testing.T) {
 		t.Fatalf("expected 400 for invalid prompt id, got %d", rec.Code)
 	}
 }
+
+// ─── Phase E.1e — /sync/status exposes deferred + dead counts (REQ-007) ─────
+
+// TestSyncStatus_IncludesDeferredAndDeadCounts: 3 deferred + 1 dead →
+// /sync/status response must have deferred_count=3 and dead_count=1.
+func TestSyncStatus_IncludesDeferredAndDeadCounts(t *testing.T) {
+	provider := &stubSyncStatusProvider{
+		status: SyncStatus{
+			Enabled:       true,
+			Phase:         "healthy",
+			DeferredCount: 3,
+			DeadCount:     1,
+		},
+	}
+
+	srv := New(newServerTestStore(t), 0)
+	srv.SetSyncStatus(provider)
+
+	req := httptest.NewRequest(http.MethodGet, "/sync/status", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if got := resp["deferred_count"]; got != float64(3) {
+		t.Errorf("expected deferred_count=3, got %v", got)
+	}
+	if got := resp["dead_count"]; got != float64(1) {
+		t.Errorf("expected dead_count=1, got %v", got)
+	}
+}

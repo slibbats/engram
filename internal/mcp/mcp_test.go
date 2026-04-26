@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3850,5 +3851,486 @@ func TestHandleSave_MCPConfig_OverridesDefaults(t *testing.T) {
 		if arr, ok := cands.([]any); ok && len(arr) > 0 {
 			t.Fatalf("expected no candidates with BM25Floor=0.0 override, got %d — MCPConfig.BM25Floor may not be wired", len(arr))
 		}
+	}
+}
+
+// ─── Phase F — mem_search annotation upgrade (REQ-004, REQ-005, REQ-012) ──────
+
+// F.1a — MemSearch_AnnotatesConflictsWith_Judged
+// REQ-004 | Design §7
+// Judged conflicts_with relation must surface as "conflicts: #<id> (<title>)".
+func TestMemSearch_AnnotatesConflictsWith_Judged(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-f1a", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsAID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1a",
+		Type:      "decision",
+		Title:     "Use in-memory cache",
+		Content:   "Cache decisions in memory for speed",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs A: %v", err)
+	}
+	obsBID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1a",
+		Type:      "decision",
+		Title:     "Use Redis for caching",
+		Content:   "Redis is the preferred caching layer",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs B: %v", err)
+	}
+
+	obsA, err := s.GetObservation(obsAID)
+	if err != nil {
+		t.Fatalf("get obs A: %v", err)
+	}
+	obsB, err := s.GetObservation(obsBID)
+	if err != nil {
+		t.Fatalf("get obs B: %v", err)
+	}
+
+	// Create and judge a conflicts_with relation: A conflicts_with B.
+	relSyncID := "rel-f1a-conflicts-01"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: obsA.SyncID,
+		TargetID: obsB.SyncID,
+	}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      store.RelationConflictsWith,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchRes, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "cache",
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+	// obsA should have annotation: conflicts: #<obsBID> (Use Redis for caching)
+	want := fmt.Sprintf("conflicts: #%d (Use Redis for caching)", obsBID)
+	if !strings.Contains(text, want) {
+		t.Fatalf("expected annotation %q in search result, got:\n%s", want, text)
+	}
+}
+
+// F.1b — MemSearch_PendingConflict_KeepsPhase1Annotation
+// REQ-004 (negative) | Design §7
+// Pending conflicts_with relation must NOT produce a conflicts: annotation.
+// The existing "conflict: contested by #<sync_id> (pending)" annotation must stay byte-for-byte.
+func TestMemSearch_PendingConflict_KeepsPhase1Annotation(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-f1b", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsAID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1b",
+		Type:      "decision",
+		Title:     "Keep Postgres decision",
+		Content:   "We keep Postgres as primary store",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs A: %v", err)
+	}
+	obsBID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1b",
+		Type:      "decision",
+		Title:     "Switch to MongoDB decision",
+		Content:   "Switch to MongoDB for flexibility",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs B: %v", err)
+	}
+
+	obsA, err := s.GetObservation(obsAID)
+	if err != nil {
+		t.Fatalf("get obs A: %v", err)
+	}
+	obsB, err := s.GetObservation(obsBID)
+	if err != nil {
+		t.Fatalf("get obs B: %v", err)
+	}
+
+	// Save PENDING relation (not judged) between A and B.
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   "rel-f1b-pending-01",
+		SourceID: obsA.SyncID,
+		TargetID: obsB.SyncID,
+	}); err != nil {
+		t.Fatalf("save pending relation: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchRes, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "decision",
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+
+	// Must NOT produce a "conflicts:" annotation (that is for judged only).
+	if strings.Contains(text, "conflicts:") {
+		t.Fatalf("pending relation must not produce conflicts: annotation, got:\n%s", text)
+	}
+	// Phase 1 pending annotation must be present byte-for-byte (minus target sync_id which varies).
+	if !strings.Contains(text, "conflict: contested by #") {
+		t.Fatalf("expected Phase 1 pending annotation 'conflict: contested by #', got:\n%s", text)
+	}
+	if !strings.Contains(text, "(pending)") {
+		t.Fatalf("expected '(pending)' in annotation, got:\n%s", text)
+	}
+	// obsBID must not appear in the annotation (Phase 1 uses sync_id, not integer id in pending case).
+	_ = obsBID // used to create the relation; not checked in pending annotation format
+}
+
+// F.1c — MemSearch_TitleEnrichment_SupersedesAndSupersededBy
+// REQ-005 | Design §7
+// judged supersedes/superseded_by annotations must include (#<id> <title>).
+func TestMemSearch_TitleEnrichment_SupersedesAndSupersededBy(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-f1c", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	oldID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1c",
+		Type:      "architecture",
+		Title:     "Old JWT approach",
+		Content:   "We used session-based auth before JWT",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add old obs: %v", err)
+	}
+	newID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1c",
+		Type:      "architecture",
+		Title:     "New JWT approach",
+		Content:   "JWT is now our authentication strategy",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add new obs: %v", err)
+	}
+
+	oldObs, err := s.GetObservation(oldID)
+	if err != nil {
+		t.Fatalf("get old obs: %v", err)
+	}
+	newObs, err := s.GetObservation(newID)
+	if err != nil {
+		t.Fatalf("get new obs: %v", err)
+	}
+
+	// newObs supersedes oldObs.
+	relSyncID := "rel-f1c-supersedes-01"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: newObs.SyncID,
+		TargetID: oldObs.SyncID,
+	}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      store.RelationSupersedes,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchRes, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "JWT approach",
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+
+	// newObs should have: supersedes: #<oldID> (Old JWT approach)
+	wantSupersedes := fmt.Sprintf("supersedes: #%d (Old JWT approach)", oldID)
+	if !strings.Contains(text, wantSupersedes) {
+		t.Fatalf("expected %q in search result, got:\n%s", wantSupersedes, text)
+	}
+	// oldObs should have: superseded_by: #<newID> (New JWT approach)
+	wantSupersededBy := fmt.Sprintf("superseded_by: #%d (New JWT approach)", newID)
+	if !strings.Contains(text, wantSupersededBy) {
+		t.Fatalf("expected %q in search result, got:\n%s", wantSupersededBy, text)
+	}
+}
+
+// F.1d — MemSearch_TitleEnrichment_FallsBackToDeleted
+// REQ-005 (edge case) | Design §7, §8
+// When the related observation has been deleted, annotation must read "(deleted)".
+func TestMemSearch_TitleEnrichment_FallsBackToDeleted(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-f1d", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// obs that will be deleted.
+	deletedID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1d",
+		Type:      "decision",
+		Title:     "Deleted target decision",
+		Content:   "This decision will be deleted",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add deleted obs: %v", err)
+	}
+	// source obs that supersedes the deleted one.
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1d",
+		Type:      "decision",
+		Title:     "Superseding decision",
+		Content:   "This decision supersedes the deleted one",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add source obs: %v", err)
+	}
+
+	deletedObs, err := s.GetObservation(deletedID)
+	if err != nil {
+		t.Fatalf("get deleted obs: %v", err)
+	}
+	sourceObs, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get source obs: %v", err)
+	}
+
+	// source supersedes deleted.
+	relSyncID := "rel-f1d-deleted-01"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: sourceObs.SyncID,
+		TargetID: deletedObs.SyncID,
+	}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      store.RelationSupersedes,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	// Soft-delete the target observation.
+	if err := s.DeleteObservation(deletedID, false); err != nil {
+		t.Fatalf("delete obs: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchRes, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "superseding decision",
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+	// Source obs should have: supersedes: #<deletedID> (deleted)
+	wantDeleted := fmt.Sprintf("supersedes: #%d (deleted)", deletedID)
+	if !strings.Contains(text, wantDeleted) {
+		t.Fatalf("expected %q for deleted target, got:\n%s", wantDeleted, text)
+	}
+}
+
+// F.1e — MemSearch_AllThreeTypes_FormatExact
+// REQ-012 | Design §7
+// All 3 annotation types present on one obs → format matches contract byte-for-byte.
+func TestMemSearch_AllThreeTypes_FormatExact(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-f1e", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Central obs that has all three relation types as source.
+	centralID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1e",
+		Type:      "architecture",
+		Title:     "Central architecture decision",
+		Content:   "This memory has all relation types",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add central obs: %v", err)
+	}
+	// Target for supersedes.
+	supersedesTargetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1e",
+		Type:      "architecture",
+		Title:     "Old architecture",
+		Content:   "The old architecture approach",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add supersedes target: %v", err)
+	}
+	// Target for conflicts_with.
+	conflictsTargetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1e",
+		Type:      "architecture",
+		Title:     "Competing architecture",
+		Content:   "A competing approach that conflicts",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add conflicts target: %v", err)
+	}
+
+	centralObs, err := s.GetObservation(centralID)
+	if err != nil {
+		t.Fatalf("get central: %v", err)
+	}
+	supersedesTarget, err := s.GetObservation(supersedesTargetID)
+	if err != nil {
+		t.Fatalf("get supersedes target: %v", err)
+	}
+	conflictsTarget, err := s.GetObservation(conflictsTargetID)
+	if err != nil {
+		t.Fatalf("get conflicts target: %v", err)
+	}
+
+	// Create judged supersedes: central supersedes supersedesTarget.
+	relSupersedes := "rel-f1e-supersedes"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSupersedes,
+		SourceID: centralObs.SyncID,
+		TargetID: supersedesTarget.SyncID,
+	}); err != nil {
+		t.Fatalf("save supersedes relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSupersedes,
+		Relation:      store.RelationSupersedes,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge supersedes: %v", err)
+	}
+
+	// Create judged conflicts_with: central conflicts_with conflictsTarget.
+	relConflicts := "rel-f1e-conflicts"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relConflicts,
+		SourceID: centralObs.SyncID,
+		TargetID: conflictsTarget.SyncID,
+	}); err != nil {
+		t.Fatalf("save conflicts relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relConflicts,
+		Relation:      store.RelationConflictsWith,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge conflicts_with: %v", err)
+	}
+
+	// Also add a superseded_by: create another obs that supersedes central (so central is target).
+	supersederID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-f1e",
+		Type:      "architecture",
+		Title:     "Newer architecture",
+		Content:   "The newest architecture supersedes central",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add superseder: %v", err)
+	}
+	supersederObs, err := s.GetObservation(supersederID)
+	if err != nil {
+		t.Fatalf("get superseder: %v", err)
+	}
+
+	relSupersededBy := "rel-f1e-superseded-by"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSupersededBy,
+		SourceID: supersederObs.SyncID,
+		TargetID: centralObs.SyncID,
+	}); err != nil {
+		t.Fatalf("save superseded_by relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSupersededBy,
+		Relation:      store.RelationSupersedes,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge superseded_by: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchRes, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "central architecture decision",
+		"project": "engram",
+		"scope":   "project",
+	}}})
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+
+	// Verify exact format for all three types on central obs.
+	wantSupersedes := fmt.Sprintf("supersedes: #%d (Old architecture)", supersedesTargetID)
+	wantConflicts := fmt.Sprintf("conflicts: #%d (Competing architecture)", conflictsTargetID)
+	wantSupersededBy := fmt.Sprintf("superseded_by: #%d (Newer architecture)", supersederID)
+
+	if !strings.Contains(text, wantSupersedes) {
+		t.Fatalf("expected %q, got:\n%s", wantSupersedes, text)
+	}
+	if !strings.Contains(text, wantConflicts) {
+		t.Fatalf("expected %q, got:\n%s", wantConflicts, text)
+	}
+	if !strings.Contains(text, wantSupersededBy) {
+		t.Fatalf("expected %q, got:\n%s", wantSupersededBy, text)
 	}
 }

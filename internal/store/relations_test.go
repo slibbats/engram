@@ -1,6 +1,10 @@
 package store
 
 import (
+	"bytes"
+	"errors"
+	"log"
+	"strings"
 	"testing"
 )
 
@@ -829,3 +833,319 @@ func TestFindCandidates_ExplicitZeroFloor(t *testing.T) {
 
 // ptrFloat64 is a test helper to create a *float64 from a literal.
 func ptrFloat64(v float64) *float64 { return &v }
+
+// ─── Phase C.1 — Push-side RED tests (REQ-001, REQ-003, REQ-011) ─────────────
+
+// setupEnrolledStore creates a test store with the standard "ses-rel-test"
+// session (project "proj-a") enrolled for cloud sync.
+// It reuses setupRelationsStore so that addTestObs helpers work unchanged.
+func setupEnrolledStore(t *testing.T) *Store {
+	t.Helper()
+	s := setupRelationsStore(t)
+	// Rename the session's project to "proj-a" so addTestObs (which uses
+	// project "testproject") needs re-seeding. Instead, re-create using addTestObsSession.
+	// However, setupRelationsStore already creates "ses-rel-test" with project "testproject".
+	// For enrolled tests we need project "proj-a" — create a second session.
+	if err := s.CreateSession("ses-enrolled-a", "proj-a", "/tmp/rel-enrolled-a"); err != nil {
+		t.Fatalf("CreateSession ses-enrolled-a: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+	return s
+}
+
+// addEnrolledObs inserts an observation in session "ses-enrolled-a" with project "proj-a".
+func addEnrolledObs(t *testing.T, s *Store, title string) (int64, string) {
+	t.Helper()
+	return addTestObsSession(t, s, "ses-enrolled-a", title, "decision", "proj-a", "project")
+}
+
+// countRelationMutations returns the number of sync_mutations rows with entity='relation'
+// and the given project value.
+func countRelationMutations(t *testing.T, s *Store, entity, project string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM sync_mutations WHERE entity = ? AND project = ?`,
+		entity, project,
+	).Scan(&n); err != nil {
+		t.Fatalf("countRelationMutations: %v", err)
+	}
+	return n
+}
+
+// C.1a — JudgeRelation on an enrolled project must enqueue a sync_mutation with
+// entity='relation', entity_key=relation.sync_id, payload with source_id,
+// target_id, judgment_status='judged', project='proj-a'.
+func TestJudgeRelation_EnqueuesSyncMutation_WhenEnrolled(t *testing.T) {
+	s := setupEnrolledStore(t)
+
+	_, syncA := addEnrolledObs(t, s, "Cache decision A")
+	_, syncB := addEnrolledObs(t, s, "Cache decision B")
+
+	relSyncID := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: syncA,
+		TargetID: syncB,
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	before := countRelationMutations(t, s, SyncEntityRelation, "proj-a")
+
+	if _, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationConflictsWith,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("JudgeRelation: %v", err)
+	}
+
+	after := countRelationMutations(t, s, SyncEntityRelation, "proj-a")
+	if after <= before {
+		t.Errorf("expected sync_mutations to gain a row for entity=%q project=%q; before=%d after=%d",
+			SyncEntityRelation, "proj-a", before, after)
+	}
+
+	// Verify entity_key equals relation sync_id.
+	var entityKey, payload string
+	if err := s.db.QueryRow(
+		`SELECT entity_key, payload FROM sync_mutations WHERE entity = ? AND project = ? ORDER BY seq DESC LIMIT 1`,
+		SyncEntityRelation, "proj-a",
+	).Scan(&entityKey, &payload); err != nil {
+		t.Fatalf("query enqueued mutation: %v", err)
+	}
+	if entityKey != relSyncID {
+		t.Errorf("entity_key: want %q, got %q", relSyncID, entityKey)
+	}
+
+	// Verify payload fields.
+	var p syncRelationPayload
+	if err := decodeSyncPayload([]byte(payload), &p); err != nil {
+		t.Fatalf("decode syncRelationPayload: %v", err)
+	}
+	if p.SourceID != syncA {
+		t.Errorf("payload.source_id: want %q, got %q", syncA, p.SourceID)
+	}
+	if p.TargetID != syncB {
+		t.Errorf("payload.target_id: want %q, got %q", syncB, p.TargetID)
+	}
+	if p.JudgmentStatus != JudgmentStatusJudged {
+		t.Errorf("payload.judgment_status: want %q, got %q", JudgmentStatusJudged, p.JudgmentStatus)
+	}
+	if p.Project != "proj-a" {
+		t.Errorf("payload.project: want %q, got %q", "proj-a", p.Project)
+	}
+}
+
+// C.1b — JudgeRelation on a non-enrolled project must NOT add to sync_mutations.
+func TestJudgeRelation_DoesNotEnqueue_WhenNotEnrolled(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("ses-notenrolled", "proj-b", "/tmp/rel-notenrolled"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// proj-b is NOT enrolled.
+
+	_, syncA := addTestObsSession(t, s, "ses-notenrolled", "Decision X", "decision", "proj-b", "project")
+	_, syncB := addTestObsSession(t, s, "ses-notenrolled", "Decision Y", "decision", "proj-b", "project")
+
+	relSyncID := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: syncA,
+		TargetID: syncB,
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	before := countRelationMutations(t, s, SyncEntityRelation, "proj-b")
+
+	if _, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationRelated,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("JudgeRelation: %v", err)
+	}
+
+	after := countRelationMutations(t, s, SyncEntityRelation, "proj-b")
+	if after != before {
+		t.Errorf("expected NO new sync_mutation for non-enrolled project; before=%d after=%d", before, after)
+	}
+}
+
+// C.1c — FindCandidates must NOT enqueue sync_mutations rows.
+func TestFindCandidates_DoesNotEnqueue(t *testing.T) {
+	s := setupEnrolledStore(t)
+
+	_, _ = addEnrolledObs(t, s, "Cache Redis strategy for sessions")
+	savedID, _ := addEnrolledObs(t, s, "Cache strategy choice Redis vs Memcached")
+
+	before := countRelationMutations(t, s, SyncEntityRelation, "proj-a")
+
+	_, _ = s.FindCandidates(savedID, CandidateOptions{
+		Project:   "proj-a",
+		Scope:     "project",
+		Limit:     3,
+		BM25Floor: ptrFloat64(-10.0),
+	})
+
+	after := countRelationMutations(t, s, SyncEntityRelation, "proj-a")
+	if after != before {
+		t.Errorf("FindCandidates must not enqueue relation mutations; before=%d after=%d", before, after)
+	}
+}
+
+// C.1d — JudgeRelation with cross-project source/target must return
+// ErrCrossProjectRelation and must not insert or update memory_relations.
+func TestJudgeRelation_RejectsCrossProject(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("ses-cross", "proj-x", "/tmp/cross"); err != nil {
+		t.Fatalf("CreateSession proj-x: %v", err)
+	}
+	if err := s.CreateSession("ses-cross-y", "proj-y", "/tmp/cross-y"); err != nil {
+		t.Fatalf("CreateSession proj-y: %v", err)
+	}
+
+	// Source in proj-x, target in proj-y.
+	_, syncA := addTestObsSession(t, s, "ses-cross", "Obs in proj-x", "decision", "proj-x", "project")
+	_, syncB := addTestObsSession(t, s, "ses-cross-y", "Obs in proj-y", "decision", "proj-y", "project")
+
+	relSyncID := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: syncA,
+		TargetID: syncB,
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	_, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationConflictsWith,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	})
+	if err == nil {
+		t.Fatal("expected ErrCrossProjectRelation; got nil")
+	}
+	if !errors.Is(err, ErrCrossProjectRelation) {
+		t.Errorf("expected ErrCrossProjectRelation; got %v", err)
+	}
+
+	// Row must remain pending (not updated to judged).
+	rel, err2 := s.GetRelation(relSyncID)
+	if err2 != nil {
+		t.Fatalf("GetRelation: %v", err2)
+	}
+	if rel.JudgmentStatus == JudgmentStatusJudged {
+		t.Error("cross-project relation must not be judged; row was modified")
+	}
+}
+
+// C.1e — When the source observation is missing, JudgeRelation must enqueue a
+// mutation with project='' (empty string, not an error).
+func TestJudgeRelation_MissingSource_EnqueuesEmptyProject(t *testing.T) {
+	s := setupEnrolledStore(t)
+
+	// Use a non-existent source sync_id and a real target.
+	_, syncB := addEnrolledObs(t, s, "Real target obs")
+
+	fakeSyncID := "obs-doesnotexist-" + newSyncID("x")
+	relSyncID := newSyncID("rel")
+
+	// Insert the relation row directly (SaveRelation validates nothing about FK).
+	if _, err := s.db.Exec(`
+		INSERT INTO memory_relations
+			(sync_id, source_id, target_id, relation, judgment_status, created_at, updated_at)
+		VALUES (?, ?, ?, 'pending', 'pending', datetime('now'), datetime('now'))
+	`, relSyncID, fakeSyncID, syncB); err != nil {
+		t.Fatalf("direct insert relation: %v", err)
+	}
+
+	before := countRelationMutations(t, s, SyncEntityRelation, "")
+
+	if _, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationRelated,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("JudgeRelation with missing source: %v", err)
+	}
+
+	after := countRelationMutations(t, s, SyncEntityRelation, "")
+	if after <= before {
+		t.Errorf("expected mutation with project='' when source is missing; before=%d after=%d", before, after)
+	}
+}
+
+// REQ-011 verify-followup: JudgeRelation with missing source MUST emit a
+// WARNING-level log mentioning the relation sync_id and the empty project.
+func TestJudgeRelation_MissingSource_EmitsWarningLog(t *testing.T) {
+	s := setupEnrolledStore(t)
+
+	_, syncB := addEnrolledObs(t, s, "Target obs for warning test")
+
+	fakeSyncID := "obs-missing-" + newSyncID("x")
+	relSyncID := newSyncID("rel")
+
+	if _, err := s.db.Exec(`
+		INSERT INTO memory_relations
+			(sync_id, source_id, target_id, relation, judgment_status, created_at, updated_at)
+		VALUES (?, ?, ?, 'pending', 'pending', datetime('now'), datetime('now'))
+	`, relSyncID, fakeSyncID, syncB); err != nil {
+		t.Fatalf("direct insert relation: %v", err)
+	}
+
+	// Capture log output.
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	if _, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationRelated,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("JudgeRelation with missing source: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "WARNING") {
+		t.Errorf("expected WARNING in log output; got: %q", logged)
+	}
+	if !strings.Contains(logged, relSyncID) {
+		t.Errorf("expected relation sync_id %q in log output; got: %q", relSyncID, logged)
+	}
+	if !strings.Contains(logged, "project=''") {
+		t.Errorf("expected \"project=''\" hint in log output; got: %q", logged)
+	}
+}
+
+// addTestObsSession inserts an observation using the specified sessionID.
+func addTestObsSession(t *testing.T, s *Store, sessionID, title, obsType, project, scope string) (int64, string) {
+	t.Helper()
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: sessionID,
+		Type:      obsType,
+		Title:     title,
+		Content:   "Content for: " + title,
+		Project:   project,
+		Scope:     scope,
+	})
+	if err != nil {
+		t.Fatalf("AddObservation(%q): %v", title, err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("GetObservation(%d): %v", id, err)
+	}
+	return id, obs.SyncID
+}

@@ -336,6 +336,13 @@ func (s *autosyncFakeStore) MarkSyncFailure(_, _ string, _ time.Time) error { re
 
 func (s *autosyncFakeStore) MarkSyncHealthy(_ string) error { return nil }
 
+// Phase E: deferred replay stubs — no-ops for the E2E fake store.
+func (s *autosyncFakeStore) ReplayDeferred() (store.ReplayDeferredResult, error) {
+	return store.ReplayDeferredResult{}, nil
+}
+
+func (s *autosyncFakeStore) CountDeferredAndDead() (int, int, error) { return 0, 0, nil }
+
 // httpPushMutations is a helper to push mutations directly to a test server.
 func httpPushMutations(t *testing.T, serverURL, token string, entries []map[string]any) *http.Response {
 	t.Helper()

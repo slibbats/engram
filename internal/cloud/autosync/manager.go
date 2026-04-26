@@ -86,6 +86,9 @@ type LocalStore interface {
 	ApplyPulledMutation(targetKey string, mutation store.SyncMutation) error
 	MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error
 	MarkSyncHealthy(targetKey string) error
+	// Phase E: deferred relation retry.
+	ReplayDeferred() (store.ReplayDeferredResult, error)
+	CountDeferredAndDead() (deferred, dead int, err error)
 }
 
 // CloudTransport is the subset of remote.MutationTransport methods the manager needs.
@@ -145,6 +148,9 @@ type Status struct {
 	LastSyncAt          *time.Time `json:"last_sync_at,omitempty"`
 	ReasonCode          string     `json:"reason_code,omitempty"`
 	ReasonMessage       string     `json:"reason_message,omitempty"`
+	// Phase E: deferred relation retry counts from sync_apply_deferred.
+	DeferredCount int `json:"deferred_count"`
+	DeadCount     int `json:"dead_count"`
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
@@ -214,10 +220,18 @@ func (m *Manager) NotifyDirty() {
 }
 
 // Status returns the current degraded-state snapshot. Thread-safe.
+// Includes live counts of deferred and dead rows from sync_apply_deferred.
 func (m *Manager) Status() Status {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.status
+	st := m.status
+	m.mu.RUnlock()
+
+	// Phase E: populate deferred/dead counts from store (live query, best-effort).
+	if deferred, dead, err := m.store.CountDeferredAndDead(); err == nil {
+		st.DeferredCount = deferred
+		st.DeadCount = dead
+	}
+	return st
 }
 
 // Stop cancels the internal context and waits for all goroutines to exit.
@@ -504,6 +518,17 @@ func (m *Manager) pull(ctx context.Context) error {
 
 	m.setPhase(PhasePulling)
 
+	// Phase E: replay deferred relation rows before fetching new mutations.
+	// This gives previously-deferred rows a chance to apply now that their
+	// referenced observations may have arrived.
+	if res, err := m.store.ReplayDeferred(); err != nil {
+		log.Printf("[autosync] replayDeferred error: %v", err)
+		// Non-fatal: log and continue — deferred replay failures must not halt pulls.
+	} else if res.Retried > 0 {
+		log.Printf("[autosync] replayDeferred: retried=%d succeeded=%d failed=%d dead=%d",
+			res.Retried, res.Succeeded, res.Failed, res.Dead)
+	}
+
 	state, err := m.store.GetSyncState(m.cfg.TargetKey)
 	if err != nil {
 		return fmt.Errorf("get sync state: %w", err)
@@ -532,6 +557,10 @@ func (m *Manager) pull(ctx context.Context) error {
 				Source:     store.SyncSourceRemote,
 				OccurredAt: rm.OccurredAt,
 			}
+			// Phase E: per-entity error policy (design §9).
+			// ApplyPulledMutation handles relation FK misses internally by writing
+			// to sync_apply_deferred and returning nil — the cursor advances normally.
+			// All other errors (legacy entities, decode errors) propagate and halt the pull.
 			if err := m.store.ApplyPulledMutation(m.cfg.TargetKey, localMut); err != nil {
 				return fmt.Errorf("apply pulled mutation seq=%d: %w", rm.Seq, err)
 			}
