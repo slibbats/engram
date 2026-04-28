@@ -46,6 +46,9 @@ engram list
 
 # Show a specific chunk
 engram show <chunk-id>
+
+# Delete a chunk you no longer need
+engram delete <chunk-id>
 ```
 
 ## Configuration
@@ -58,6 +61,8 @@ Engram stores its data in `.engram/` at the root of your project:
   chunks/             # Compressed JSONL chunk files
     *.jsonl.gz
 ```
+
+> **Personal note:** I keep a global engram knowledge base in `~/.engram/` by symlinking it, which lets me share snippets across all my projects.
 
 ## Plugin Marketplace
 
