@@ -62,7 +62,7 @@ Engram stores its data in `.engram/` at the root of your project:
     *.jsonl.gz
 ```
 
-> **Personal note:** I keep a global engram knowledge base in `~/.engram/` by symlinking it, which lets me share snippets across all my projects.
+> **Personal note:** I keep a global engram knowledge base in `~/.engram/` by symlinking it, which lets me share snippets across all my projects. I also add `.engram/` to my global `.gitignore` so it never accidentally gets committed to work repos.
 
 ## Plugin Marketplace
 
